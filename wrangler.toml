@@ -1,0 +1,8 @@
+name = "av-ingest"
+main = "worker/worker.js"
+compatibility_date = "2026-05-10"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"

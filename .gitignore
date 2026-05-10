@@ -1,0 +1,5 @@
+target/
+public/pkg/
+node_modules/
+.wrangler/
+.DS_Store

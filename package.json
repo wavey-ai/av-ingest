@@ -1,0 +1,14 @@
+{
+  "name": "av-ingest",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build crates/extractor --target web --out-dir ../../public/pkg --out-name av_ingest_extractor",
+    "check": "node --check public/app.js && node --check worker/worker.js && cargo test --workspace",
+    "dev": "wrangler dev --local --port 8789"
+  },
+  "devDependencies": {
+    "wrangler": "^4.90.0"
+  }
+}

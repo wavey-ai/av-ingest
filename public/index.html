@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>av-ingest</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="masthead">
+        <div>
+          <p class="kicker">browser ingest</p>
+          <h1>av-ingest</h1>
+        </div>
+        <a href="https://github.com/wavey-ai/av-ingest" rel="noreferrer" target="_blank">Repo</a>
+      </header>
+
+      <section class="source-panel">
+        <div class="source-row">
+          <label>
+            Source URL
+            <input
+              id="source-url"
+              type="url"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="YouTube, SoundCloud, or direct MP4/WebM URL"
+            />
+          </label>
+          <button id="load-source" type="button">Load</button>
+        </div>
+        <p id="status" class="status">Idle</p>
+      </section>
+
+      <section class="stage">
+        <div class="video-shell">
+          <video id="video" crossorigin="anonymous" playsinline controls></video>
+        </div>
+
+        <div class="controls">
+          <button id="prev-frame" type="button" disabled>Previous frame</button>
+          <button id="capture-frame" type="button" disabled>Capture frame</button>
+          <button id="next-frame" type="button" disabled>Next frame</button>
+          <label>
+            Source
+            <select id="format-select" disabled></select>
+          </label>
+        </div>
+
+        <div class="readout">
+          <span id="time-readout">0:00.000</span>
+          <span id="video-readout">No video loaded</span>
+        </div>
+
+        <canvas id="frame-canvas" width="1280" height="720"></canvas>
+      </section>
+
+      <details class="log-panel">
+        <summary>Log</summary>
+        <pre id="log"></pre>
+      </details>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
