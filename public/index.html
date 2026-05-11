@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>av-ingest</title>
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./style.css?v=20260511b" />
   </head>
   <body>
     <main class="app">
@@ -30,7 +30,10 @@
           </label>
           <button id="load-source" type="button">Load</button>
         </div>
-        <p id="status" class="status">Idle</p>
+        <div class="status-row">
+          <p id="status" class="status">Idle</p>
+          <p id="proxy-readout" class="proxy-readout"></p>
+        </div>
       </section>
 
       <section class="stage">
@@ -40,7 +43,7 @@
 
         <div class="controls">
           <button id="prev-frame" type="button" disabled>Previous frame</button>
-          <button id="capture-frame" type="button" disabled>Capture frame</button>
+          <button id="select-frame" type="button" disabled>Select frame</button>
           <button id="next-frame" type="button" disabled>Next frame</button>
           <label>
             Source
@@ -53,7 +56,16 @@
           <span id="video-readout">No video loaded</span>
         </div>
 
-        <canvas id="frame-canvas" width="1280" height="720"></canvas>
+        <div class="canvas-grid">
+          <figure>
+            <figcaption>Current frame</figcaption>
+            <canvas id="preview-canvas" width="1280" height="720"></canvas>
+          </figure>
+          <figure>
+            <figcaption>Selected frame</figcaption>
+            <canvas id="selected-canvas" width="1280" height="720"></canvas>
+          </figure>
+        </div>
       </section>
 
       <details class="log-panel">
@@ -62,6 +74,6 @@
       </details>
     </main>
 
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.js?v=20260511b"></script>
   </body>
 </html>

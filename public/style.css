@@ -108,11 +108,26 @@ select:disabled {
   opacity: 0.48;
 }
 
-.status {
+.status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+}
+
+.status,
+.proxy-readout {
   min-height: 22px;
-  margin: 10px 0 0;
+  margin: 0;
   color: #4b5563;
   font-weight: 700;
+}
+
+.proxy-readout {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-align: right;
 }
 
 .stage {
@@ -149,6 +164,25 @@ video {
   font-size: 13px;
 }
 
+.canvas-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+}
+
+figure {
+  margin: 0;
+}
+
+figcaption {
+  margin: 0 0 7px;
+  color: #6b655c;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 canvas {
   border: 1px solid rgba(24, 24, 27, 0.12);
   background: #111827;
@@ -171,8 +205,19 @@ pre {
 
 @media (max-width: 760px) {
   .source-row,
-  .controls {
+  .controls,
+  .canvas-grid,
+  .status-row {
     grid-template-columns: 1fr;
+  }
+
+  .status-row {
+    display: grid;
+    align-items: start;
+  }
+
+  .proxy-readout {
+    text-align: left;
   }
 
   button {

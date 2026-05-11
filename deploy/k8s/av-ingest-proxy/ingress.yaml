@@ -1,0 +1,22 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: av-ingest-proxy
+  namespace: av-ingest
+spec:
+  ingressClassName: haproxy
+  tls:
+    - hosts:
+        - av-proxy.wavey.ai
+      secretName: av-proxy-wavey-ai-tls
+  rules:
+    - host: av-proxy.wavey.ai
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: av-ingest-proxy
+                port:
+                  number: 8444

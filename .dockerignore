@@ -1,0 +1,9 @@
+.git
+.github
+node_modules
+public/pkg
+target
+*.log
+.wrangler
+.env
+.env.*

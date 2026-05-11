@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: av-ingest-proxy
+  namespace: av-ingest
+  labels:
+    app.kubernetes.io/name: av-ingest-proxy
+    app.kubernetes.io/part-of: av-ingest
+spec:
+  selector:
+    app.kubernetes.io/name: av-ingest-proxy
+  ports:
+    - name: https
+      port: 8444
+      targetPort: https

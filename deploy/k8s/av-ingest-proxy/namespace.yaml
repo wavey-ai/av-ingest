@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: av-ingest
+  labels:
+    app.kubernetes.io/part-of: av-ingest
+    wavey.ai/cluster-slice: av-ingest

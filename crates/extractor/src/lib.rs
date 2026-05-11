@@ -17,12 +17,15 @@ struct SourceInfo {
 struct BrowserVideoFormat {
     itag: Option<u64>,
     label: String,
-    url: String,
+    url: Option<String>,
+    signature_cipher: Option<String>,
+    cipher: Option<String>,
     mime_type: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
     fps: Option<u64>,
     has_audio: bool,
+    needs_challenge: bool,
     source: String,
 }
 
@@ -74,11 +77,9 @@ pub fn select_browser_video_formats(player_response_json: &str) -> Result<JsValu
     collect_formats(&root, "adaptiveFormats", &mut formats);
 
     formats.sort_by(|a, b| format_score(b).cmp(&format_score(a)));
-    formats.dedup_by(|a, b| a.url == b.url);
+    formats.dedup_by(|a, b| format_key(a) == format_key(b));
     if formats.is_empty() {
-        return Err(js_error(
-            "No browser-playable YouTube URL is available yet. This video requires the YouTube player JS n/signature challenge solver.",
-        ));
+        return Err(js_error("No browser-playable YouTube video formats found."));
     }
     to_js(&formats)
 }
@@ -103,12 +104,21 @@ fn collect_formats(root: &Value, key: &str, out: &mut Vec<BrowserVideoFormat>) {
         if !is_video {
             continue;
         }
-        let Some(url) = item.get("url").and_then(Value::as_str) else {
+        let url = item.get("url").and_then(Value::as_str).map(str::to_string);
+        let signature_cipher = item
+            .get("signatureCipher")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let cipher = item
+            .get("cipher")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if url.is_none() && signature_cipher.is_none() && cipher.is_none() {
             continue;
         };
-        if url_has_n_challenge(url) {
-            continue;
-        }
+        let needs_challenge = url.as_deref().is_some_and(url_has_n_challenge)
+            || signature_cipher.is_some()
+            || cipher.is_some();
         let width = item.get("width").and_then(Value::as_u64);
         let height = item.get("height").and_then(Value::as_u64);
         let fps = item.get("fps").and_then(Value::as_u64);
@@ -133,15 +143,28 @@ fn collect_formats(root: &Value, key: &str, out: &mut Vec<BrowserVideoFormat>) {
         out.push(BrowserVideoFormat {
             itag,
             label,
-            url: url.to_string(),
+            url,
+            signature_cipher,
+            cipher,
             mime_type,
             width,
             height,
             fps,
             has_audio,
+            needs_challenge,
             source: key.to_string(),
         });
     }
+}
+
+fn format_key(format: &BrowserVideoFormat) -> String {
+    format
+        .url
+        .as_deref()
+        .or(format.signature_cipher.as_deref())
+        .or(format.cipher.as_deref())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn url_has_n_challenge(value: &str) -> bool {
@@ -166,7 +189,7 @@ fn format_score(format: &BrowserVideoFormat) -> u64 {
             }
         })
         .unwrap_or(0);
-    let audio_bonus = if format.has_audio { 200 } else { 0 };
+    let audio_bonus = if format.has_audio { 100_000 } else { 0 };
     height * 10 + fps + codec_bonus + audio_bonus
 }
 

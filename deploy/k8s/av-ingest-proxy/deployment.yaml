@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: av-ingest-proxy
+  namespace: av-ingest
+  labels:
+    app.kubernetes.io/name: av-ingest-proxy
+    app.kubernetes.io/part-of: av-ingest
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: av-ingest-proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: av-ingest-proxy
+        app.kubernetes.io/part-of: av-ingest
+    spec:
+      serviceAccountName: av-ingest-proxy
+      imagePullSecrets:
+        - name: ghcr-wavey-ai
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: wavey.ai/node-role
+                    operator: In
+                    values:
+                      - cpu
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+      containers:
+        - name: proxy
+          image: ghcr.io/wavey-ai/av-ingest-proxy:main
+          imagePullPolicy: Always
+          ports:
+            - name: https
+              containerPort: 8444
+          env:
+            - name: RUST_LOG
+              value: av_ingest_proxy=info,web_service=info
+            - name: AV_INGEST_PROXY_PORT
+              value: "8444"
+            - name: AV_INGEST_PROXY_TLS_CERT_PATH
+              value: /var/run/av-ingest-proxy/tls/tls.crt
+            - name: AV_INGEST_PROXY_TLS_KEY_PATH
+              value: /var/run/av-ingest-proxy/tls/tls.key
+          volumeMounts:
+            - name: proxy-tls
+              mountPath: /var/run/av-ingest-proxy/tls
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /healthz
+              port: https
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+      volumes:
+        - name: proxy-tls
+          secret:
+            secretName: av-ingest-proxy-tls
