@@ -424,7 +424,7 @@ function youtubeProxyUrl(videoId, itag, resolver) {
 function selectYouTubeFormats(resolved) {
   const hlsFormat = nativeHlsFormat(resolved);
   try {
-    const formats = selectBrowserVideoFormats(JSON.stringify(resolved.playerResponse));
+    const formats = filterBrowserFormats(selectBrowserVideoFormats(JSON.stringify(resolved.playerResponse)));
     if (hlsFormat) {
       formats.unshift(hlsFormat);
     }
@@ -452,6 +452,14 @@ function selectYouTubeFormats(resolved) {
         `${summary.videoFormats} video formats from ${summary.formats + summary.adaptiveFormats} total streams).`,
     );
   }
+}
+
+function filterBrowserFormats(formats) {
+  if (!canPlayNativeHls()) {
+    return formats;
+  }
+  const filtered = formats.filter((format) => format.hasAudio || format.source !== "adaptiveFormats");
+  return filtered.length ? filtered : formats;
 }
 
 function nativeHlsFormat(resolved) {
