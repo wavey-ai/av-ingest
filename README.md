@@ -115,7 +115,7 @@ by the deployed Worker. Payload size was `7,232,158` bytes.
 | Rust proxy, 1 KB range | 1 | 206 | n/a | n/a | Returned `Content-Range` and exactly 1024 bytes |
 | Cloudflare Worker googlevideo probe | repeated | 403 | n/a | n/a | Reason for the Rust proxy |
 
-The proxy binary built on macOS was `9.8 MB`. The production container is a
+The proxy binary built on macOS was `9.9 MB`. The production container is a
 single Rust process on Debian slim with no Python runtime.
 
 ## Deployment
@@ -128,7 +128,7 @@ CLOUDFLARE_API_KEY="$(tr -d '\n\r' < /Users/jamie/wavey.ai/.cloudflare-token)" \
 npx wrangler deploy
 ```
 
-Rust media proxy:
+Rust media proxy, intended permanent path:
 
 ```bash
 gh workflow run deploy-av-ingest-proxy.yml \
@@ -141,6 +141,16 @@ Cloudflare deployment secrets are already attached to that repo. It builds
 `ghcr.io/wavey-ai/av-ingest-proxy`, deploys the Kubernetes manifests under
 `deploy/k8s/av-ingest-proxy`, creates `av-proxy.wavey.ai`, and verifies health
 plus a byte-range media fetch.
+
+Current live proxy:
+
+```bash
+cloudflared tunnel --config .cloudflared/config.yml run
+```
+
+This points `av-proxy.wavey.ai` at the local Rust proxy through Cloudflare
+Tunnel. It is useful while the bitneedle GitHub Actions runner path is returning
+`startup_failure` before jobs are scheduled.
 
 ## upload-response
 

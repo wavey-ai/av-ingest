@@ -1,5 +1,5 @@
+.cloudflared/
+.wrangler/
+node_modules/
 target/
 public/pkg/
-node_modules/
-.wrangler/
-.DS_Store
