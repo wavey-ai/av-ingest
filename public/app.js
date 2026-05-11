@@ -21,9 +21,10 @@ const els = {
 };
 
 const API_BASE_PATH = "/api/av-ingest";
-const ASSET_VERSION = "20260511a";
+const ASSET_VERSION = "20260511c";
 const PUBLIC_MEDIA_PROXY_BASE_URL = "https://av-proxy.wavey.ai";
 const MEDIA_PROXY_BASE_URL = resolveMediaProxyBaseUrl();
+const NATIVE_HLS_MIME_TYPE = "application/vnd.apple.mpegurl";
 let wasmReady;
 let currentFormats = [];
 let youtubeChallengeWorker;
@@ -137,6 +138,7 @@ async function attachVideo(format) {
   await probeFormat(format);
   els.video.pause();
   els.video.removeAttribute("src");
+  els.video.crossOrigin = "anonymous";
   els.video.load();
   els.video.src = format.url;
   els.video.type = format.mimeType || "";
@@ -162,6 +164,17 @@ async function attachFirstAvailable() {
 
 async function probeFormat(format) {
   setStatus(`Probing ${format.label}`);
+  if (format.kind === "hls") {
+    const response = await fetch(format.url, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`Media probe failed (${response.status}) for ${format.label}.`);
+    }
+    const body = await response.text();
+    if (!body.trimStart().startsWith("#EXTM3U")) {
+      throw new Error(`Media probe did not return an HLS playlist for ${format.label}.`);
+    }
+    return;
+  }
   const response = await fetch(format.url, { cache: "no-store", headers: { Range: "bytes=0-1023" } });
   if (response.ok || response.status === 206) {
     return;
@@ -409,9 +422,17 @@ function youtubeProxyUrl(videoId, itag, resolver) {
 }
 
 function selectYouTubeFormats(resolved) {
+  const hlsFormat = nativeHlsFormat(resolved);
   try {
-    return selectBrowserVideoFormats(JSON.stringify(resolved.playerResponse));
+    const formats = selectBrowserVideoFormats(JSON.stringify(resolved.playerResponse));
+    if (hlsFormat) {
+      formats.unshift(hlsFormat);
+    }
+    return formats;
   } catch (error) {
+    if (hlsFormat) {
+      return [hlsFormat];
+    }
     const summary = summarizePlayerResponse(resolved);
     log({
       error: error?.message || String(error),
@@ -431,6 +452,34 @@ function selectYouTubeFormats(resolved) {
         `${summary.videoFormats} video formats from ${summary.formats + summary.adaptiveFormats} total streams).`,
     );
   }
+}
+
+function nativeHlsFormat(resolved) {
+  const hlsUrl = resolved.playerResponse?.streamingData?.hlsManifestUrl;
+  if (!hlsUrl || !canPlayNativeHls()) {
+    return null;
+  }
+  return {
+    kind: "hls",
+    label: "HLS stream",
+    url: hlsUrl,
+    mimeType: NATIVE_HLS_MIME_TYPE,
+    width: null,
+    height: null,
+    fps: 30,
+    hasAudio: true,
+    needsChallenge: false,
+    source: "hlsManifestUrl",
+  };
+}
+
+function canPlayNativeHls() {
+  const video = document.createElement("video");
+  return Boolean(
+    video.canPlayType(NATIVE_HLS_MIME_TYPE) ||
+      video.canPlayType("application/x-mpegURL") ||
+      video.canPlayType("audio/mpegurl"),
+  );
 }
 
 function summarizePlayerResponse(response) {

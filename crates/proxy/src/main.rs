@@ -145,6 +145,10 @@ impl MediaProxy {
             }
         };
 
+        if req.method() == Method::GET && is_hls_response(&response) {
+            return self.write_hls_playlist(writer, response).await;
+        }
+
         let head = streaming_head(&response)?;
         writer.send_response(head).await?;
 
@@ -159,6 +163,41 @@ impl MediaProxy {
                 writer.send_data(chunk).await?;
             }
         }
+        writer.finish().await
+    }
+
+    async fn write_hls_playlist(
+        &self,
+        mut writer: Box<dyn StreamWriter>,
+        response: reqwest::Response,
+    ) -> HandlerResult<()> {
+        let status = status_from_reqwest(response.status())?;
+        let base_url = response.url().clone();
+        let body = response.bytes().await.map_err(reqwest_error)?;
+        let text = String::from_utf8_lossy(&body);
+        let body = if text.trim_start().starts_with("#EXTM3U") {
+            Bytes::from(rewrite_hls_playlist(&text, &base_url))
+        } else {
+            body
+        };
+
+        let response = Response::builder()
+            .status(status)
+            .header("content-type", "application/vnd.apple.mpegurl")
+            .header("content-length", body.len().to_string())
+            .header("cache-control", "no-store")
+            .header("x-handled-by", "av-ingest-proxy")
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
+            .header("access-control-allow-headers", "Range, Content-Type, If-Range")
+            .header("access-control-allow-private-network", "true")
+            .header(
+                "access-control-expose-headers",
+                "accept-ranges, content-length, content-range, content-type, etag, last-modified, x-handled-by",
+            )
+            .body(())?;
+        writer.send_response(response).await?;
+        writer.send_data(body).await?;
         writer.finish().await
     }
 
@@ -228,6 +267,12 @@ impl MediaProxy {
             .status(status)
             .header("cache-control", "no-store")
             .header("x-handled-by", "av-ingest-proxy")
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
+            .header(
+                "access-control-allow-headers",
+                "Range, Content-Type, If-Range",
+            )
             .body(())?;
         writer.send_response(response).await?;
         writer.finish().await
@@ -244,6 +289,12 @@ impl MediaProxy {
             .header("content-type", "text/plain; charset=utf-8")
             .header("cache-control", "no-store")
             .header("x-handled-by", "av-ingest-proxy")
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
+            .header(
+                "access-control-allow-headers",
+                "Range, Content-Type, If-Range",
+            )
             .body(())?;
         writer.send_response(response).await?;
         writer
@@ -323,12 +374,109 @@ fn streaming_head(response: &reqwest::Response) -> HandlerResult<Response<()>> {
     builder = builder
         .header("cache-control", "no-store")
         .header("x-handled-by", "av-ingest-proxy")
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
+        .header("access-control-allow-headers", "Range, Content-Type, If-Range")
         .header("access-control-allow-private-network", "true")
         .header(
             "access-control-expose-headers",
             "accept-ranges, content-length, content-range, content-type, etag, last-modified, x-handled-by",
         );
     builder.body(()).map_err(ServerError::Http)
+}
+
+fn is_hls_response(response: &reqwest::Response) -> bool {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    content_type.contains("mpegurl")
+        || content_type.contains("vnd.apple.mpegurl")
+        || response
+            .url()
+            .path()
+            .to_ascii_lowercase()
+            .ends_with(".m3u8")
+}
+
+fn rewrite_hls_playlist(input: &str, base_url: &Url) -> String {
+    let mut output = String::with_capacity(input.len() + 1024);
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            output.push('\n');
+        } else if trimmed.starts_with('#') {
+            output.push_str(&rewrite_hls_uri_attributes(line, base_url));
+            output.push('\n');
+        } else {
+            output.push_str(&proxied_hls_uri(trimmed, base_url));
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn rewrite_hls_uri_attributes(line: &str, base_url: &Url) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(index) = rest.find("URI=\"") {
+        let (before, _) = rest.split_at(index + 5);
+        output.push_str(before);
+        let value_start = index + 5;
+        let value_and_rest = &rest[value_start..];
+        let Some(end) = value_and_rest.find('"') else {
+            output.push_str(value_and_rest);
+            return output;
+        };
+        let value = &value_and_rest[..end];
+        output.push_str(&proxied_hls_uri(value, base_url));
+        output.push('"');
+        rest = &value_and_rest[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn proxied_hls_uri(value: &str, base_url: &Url) -> String {
+    if value.starts_with("data:") || value.starts_with("blob:") || value.starts_with('#') {
+        return value.to_string();
+    }
+    match base_url.join(value) {
+        Ok(url) if url.scheme() == "https" || url.scheme() == "http" => {
+            format!(
+                "/proxy?url={}",
+                percent_encode_query_component(url.as_str())
+            )
+        }
+        _ => value.to_string(),
+    }
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char)
+            }
+            _ => {
+                output.push('%');
+                output.push(
+                    char::from_digit((byte >> 4) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+                output.push(
+                    char::from_digit((byte & 0x0f) as u32, 16)
+                        .unwrap()
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    output
 }
 
 fn target_url(req: &Request<()>) -> Result<Url, String> {
@@ -626,5 +774,18 @@ mod tests {
             target_url(&req).unwrap().as_str(),
             "https://example.com/video.mp4?a=1"
         );
+    }
+
+    #[test]
+    fn rewrites_hls_playlist_urls_through_proxy() {
+        let base =
+            Url::parse("https://manifest.googlevideo.com/api/manifest/hls_playlist/abc").unwrap();
+        let rewritten = rewrite_hls_playlist(
+            "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\nseg-1.m4s\nhttps://rr1---sn.googlevideo.com/videoplayback?id=1&itag=137\n",
+            &base,
+        );
+        assert!(rewritten.contains("#EXT-X-MAP:URI=\"/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Finit.mp4\""));
+        assert!(rewritten.contains("/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Fseg-1.m4s"));
+        assert!(rewritten.contains("/proxy?url=https%3A%2F%2Frr1---sn.googlevideo.com%2Fvideoplayback%3Fid%3D1%26itag%3D137"));
     }
 }

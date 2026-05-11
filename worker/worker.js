@@ -217,15 +217,35 @@ async function resolveSource(requestUrl) {
     watchHtml = await watchResponse.text();
     playerResponse = extractInitialPlayerResponse(watchHtml);
   }
-  if (!playerResponse?.streamingData || playerResponseNeedsChallenge(playerResponse)) {
+  if (!playerResponseHasStreams(playerResponse) || playerResponseNeedsChallenge(playerResponse)) {
     const watchPlayerResponse = playerResponse;
     const resolved = await fetchBestInnertubePlayerResponse(videoId);
     resolver = resolved.resolver;
     playerResponse = resolved.playerResponse;
-    if (watchPlayerResponse?.streamingData && playerResponseNeedsChallenge(playerResponse)) {
+    if (
+      playerResponseHasStreams(watchPlayerResponse) &&
+      (!playerResponseHasStreams(playerResponse) || playerResponseNeedsChallenge(playerResponse))
+    ) {
       resolver = "watch";
       playerResponse = watchPlayerResponse;
     }
+  }
+
+  if (!playerResponseHasStreams(playerResponse)) {
+    return jsonResponse(
+      {
+        error: "No browser-playable YouTube video formats found.",
+        provider: "youtube",
+        resolver,
+        watchStatus,
+        url: sourceUrl.toString(),
+        playabilityStatus: playerResponse?.playabilityStatus?.status || null,
+        playabilityReason: playerResponse?.playabilityStatus?.reason || null,
+        attempts: playerResponse?.__avIngestAttempts || [],
+        playerResponse,
+      },
+      502,
+    );
   }
   const playerChallenge = playerResponseNeedsChallenge(playerResponse)
     ? await extractPlayerChallenge(watchHtml)
