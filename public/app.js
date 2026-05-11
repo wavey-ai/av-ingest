@@ -20,7 +20,6 @@ const els = {
   log: document.querySelector("#log"),
 };
 
-const API_BASE_PATH = "/api/av-ingest";
 const ASSET_VERSION = "20260511c";
 const PUBLIC_MEDIA_PROXY_BASE_URL = "https://av-proxy.wavey.ai";
 const MEDIA_PROXY_BASE_URL = resolveMediaProxyBaseUrl();
@@ -124,7 +123,7 @@ async function resolveYouTube(url) {
     url,
     _: String(Date.now()),
   });
-  const response = await fetch(`${API_BASE_PATH}/resolve?${params}`, { cache: "no-store" });
+  const response = await fetch(`${MEDIA_PROXY_BASE_URL}/resolve?${params}`, { cache: "no-store" });
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -206,7 +205,7 @@ async function resolveYouTubeFormats(formats, resolved, source) {
   for (const format of formats) {
     try {
       if (!format.needsChallenge && format.itag && source.id) {
-        if (format.url && MEDIA_PROXY_BASE_URL !== API_BASE_PATH) {
+        if (format.url) {
           solved.push({
             ...format,
             mediaUrl: format.url,
@@ -214,12 +213,6 @@ async function resolveYouTubeFormats(formats, resolved, source) {
           });
           continue;
         }
-        solved.push({
-          ...format,
-          mediaUrl: null,
-          url: youtubeProxyUrl(source.id, format.itag, resolved.resolver),
-        });
-        continue;
       }
       const mediaUrl = await resolveYouTubeMediaUrl(format, playerChallenge?.script || "");
       solved.push({
@@ -410,17 +403,6 @@ function proxyUrl(url) {
   return `${MEDIA_PROXY_BASE_URL}/proxy?url=${encodeURIComponent(url)}`;
 }
 
-function youtubeProxyUrl(videoId, itag, resolver) {
-  const params = new URLSearchParams({
-    videoId,
-    itag: String(itag),
-  });
-  if (resolver) {
-    params.set("client", resolver);
-  }
-  return `${API_BASE_PATH}/youtube-proxy?${params}`;
-}
-
 function selectYouTubeFormats(resolved) {
   const hlsFormat = nativeHlsFormat(resolved);
   try {
@@ -522,7 +504,7 @@ function resolveMediaProxyBaseUrl() {
   if (window.location.hostname === "wavey.ai" || window.location.hostname === "www.wavey.ai") {
     return PUBLIC_MEDIA_PROXY_BASE_URL;
   }
-  return API_BASE_PATH;
+  return PUBLIC_MEDIA_PROXY_BASE_URL;
 }
 
 function formatTime(seconds) {

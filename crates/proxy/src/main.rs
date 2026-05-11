@@ -5,6 +5,7 @@ use futures_util::StreamExt;
 use http::{Method, Request, Response, StatusCode};
 use reqwest::redirect::Policy;
 use reqwest::Url;
+use serde_json::{json, Value};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -18,6 +19,11 @@ use web_service::{
 
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+const YOUTUBE_WEB_API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const ANDROID_USER_AGENT: &str =
+    "com.google.android.youtube/21.03.36(Linux; U; Android 16; en_US; SM-S908E Build/TP1A.220624.014) gzip";
+const IOS_USER_AGENT: &str =
+    "com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)";
 
 #[derive(Clone)]
 struct AppConfig {
@@ -94,6 +100,111 @@ impl MediaProxy {
             status: StatusCode::NO_CONTENT,
             body: None,
             content_type: None,
+            headers: base_response_headers(),
+            etag: None,
+        }
+    }
+
+    async fn resolve_source(&self, req: Request<()>) -> HandlerResponse {
+        if req.method() == Method::OPTIONS {
+            return self.options();
+        }
+        if req.method() != Method::GET {
+            return self.text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+        }
+
+        let Some(source) = query_param(req.uri().query().unwrap_or_default(), "url") else {
+            return self.text_response(StatusCode::BAD_REQUEST, "Missing url query parameter");
+        };
+        let source = match percent_decode(source) {
+            Ok(value) => value,
+            Err(error) => return self.text_response(StatusCode::BAD_REQUEST, &error),
+        };
+        let source_url = match Url::parse(&source) {
+            Ok(url) => url,
+            Err(error) => {
+                return self.text_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("Invalid url query parameter: {error}"),
+                )
+            }
+        };
+        if !is_youtube_host(source_url.host_str().unwrap_or_default()) {
+            return self.json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "Only YouTube resolve is implemented."}),
+            );
+        }
+        let Some(video_id) = extract_youtube_id(&source_url) else {
+            return self.text_response(
+                StatusCode::BAD_REQUEST,
+                "Could not extract YouTube video id.",
+            );
+        };
+
+        match self.fetch_best_innertube_player_response(&video_id).await {
+            Ok((resolver, mut player_response, attempts)) => {
+                if let Some(object) = player_response.as_object_mut() {
+                    object.insert(
+                        "__avIngestAttempts".to_string(),
+                        Value::Array(attempts.clone()),
+                    );
+                }
+                if !player_response_has_streams(&player_response) {
+                    return self.json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({
+                            "error": "No browser-playable YouTube video formats found.",
+                            "provider": "youtube",
+                            "resolver": resolver,
+                            "watchStatus": Value::Null,
+                            "url": source_url.as_str(),
+                            "playabilityStatus": player_response.pointer("/playabilityStatus/status").cloned().unwrap_or(Value::Null),
+                            "playabilityReason": player_response.pointer("/playabilityStatus/reason").cloned().unwrap_or(Value::Null),
+                            "attempts": attempts,
+                            "playerResponse": player_response,
+                        }),
+                    );
+                }
+                self.json_response(
+                    StatusCode::OK,
+                    json!({
+                        "provider": "youtube",
+                        "resolver": resolver,
+                        "watchStatus": Value::Null,
+                        "url": source_url.as_str(),
+                        "title": player_response.pointer("/videoDetails/title").cloned().unwrap_or(Value::Null),
+                        "durationSeconds": player_response
+                            .pointer("/videoDetails/lengthSeconds")
+                            .and_then(Value::as_str)
+                            .and_then(|value| value.parse::<u64>().ok()),
+                        "playerChallenge": Value::Null,
+                        "playerResponse": player_response,
+                    }),
+                )
+            }
+            Err(error) => self.json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("YouTube resolve failed: {error}")}),
+            ),
+        }
+    }
+
+    fn json_response(&self, status: StatusCode, value: Value) -> HandlerResponse {
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from(format!("{value:#}\n"))),
+            content_type: Some("application/json; charset=utf-8".to_string()),
+            headers: base_response_headers(),
+            etag: None,
+        }
+    }
+
+    fn text_response(&self, status: StatusCode, message: &str) -> HandlerResponse {
+        HandlerResponse {
+            status,
+            body: Some(Bytes::from(format!("{}\n", message.trim_end()))),
+            content_type: Some("text/plain; charset=utf-8".to_string()),
             headers: base_response_headers(),
             etag: None,
         }
@@ -199,6 +310,117 @@ impl MediaProxy {
         writer.send_response(response).await?;
         writer.send_data(body).await?;
         writer.finish().await
+    }
+
+    async fn fetch_best_innertube_player_response(
+        &self,
+        video_id: &str,
+    ) -> Result<(String, Value, Vec<Value>), String> {
+        let mut fallback: Option<(String, Value)> = None;
+        let mut attempts = Vec::new();
+
+        for client in innertube_clients() {
+            match self
+                .fetch_innertube_player_response(video_id, &client)
+                .await
+            {
+                Ok(player_response) => {
+                    let status = player_response
+                        .pointer("/playabilityStatus/status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let has_streaming_data = player_response.get("streamingData").is_some();
+                    let has_video_streams = player_response_has_streams(&player_response);
+                    attempts.push(json!({
+                        "client": client.id,
+                        "status": if status.is_empty() { Value::Null } else { Value::String(status.clone()) },
+                        "hasStreamingData": has_streaming_data,
+                        "hasVideoStreams": has_video_streams,
+                    }));
+                    fallback = Some((format!("innertube_{}", client.id), player_response.clone()));
+                    if has_video_streams && !player_response_needs_challenge(&player_response) {
+                        return Ok((
+                            format!("innertube_{}", client.id),
+                            player_response,
+                            attempts,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    attempts.push(json!({
+                        "client": client.id,
+                        "error": error,
+                    }));
+                }
+            }
+        }
+
+        if let Some((resolver, player_response)) = fallback {
+            return Ok((resolver, player_response, attempts));
+        }
+
+        let summary = attempts
+            .iter()
+            .map(|attempt| {
+                let client = attempt
+                    .get("client")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = attempt
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .or_else(|| attempt.get("error").and_then(Value::as_str))
+                    .unwrap_or("unknown");
+                format!("{client}: {status}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("all InnerTube clients failed ({summary})"))
+    }
+
+    async fn fetch_innertube_player_response(
+        &self,
+        video_id: &str,
+        client: &InnertubeClient,
+    ) -> Result<Value, String> {
+        let mut context = json!({ "client": client.context.clone() });
+        if let Some(third_party) = client.third_party.clone() {
+            context["thirdParty"] = third_party;
+        }
+
+        let body = json!({
+            "videoId": video_id,
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+            "context": context,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS"
+                }
+            }
+        });
+        let response = self
+            .client
+            .post(format!(
+                "https://youtubei.googleapis.com/youtubei/v1/player?key={YOUTUBE_WEB_API_KEY}"
+            ))
+            .header(reqwest::header::USER_AGENT, client.user_agent)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ORIGIN, "https://www.youtube.com")
+            .header(reqwest::header::REFERER, "https://www.youtube.com/")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("InnerTube HTTP {status}"));
+        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn fetch_upstream(
@@ -309,11 +531,94 @@ enum ProxyFetchError {
     BadGateway(String),
 }
 
+struct InnertubeClient {
+    id: &'static str,
+    user_agent: &'static str,
+    context: Value,
+    third_party: Option<Value>,
+}
+
+fn innertube_clients() -> Vec<InnertubeClient> {
+    vec![
+        InnertubeClient {
+            id: "android",
+            user_agent: ANDROID_USER_AGENT,
+            context: json!({
+                "clientName": "ANDROID",
+                "clientVersion": "21.03.36",
+                "androidSdkVersion": 36,
+                "osName": "Android",
+                "osVersion": "13",
+                "platform": "MOBILE",
+                "clientFormFactor": "SMALL_FORM_FACTOR",
+                "userAgent": ANDROID_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+        },
+        InnertubeClient {
+            id: "android_embedded",
+            user_agent: ANDROID_USER_AGENT,
+            context: json!({
+                "clientName": "ANDROID",
+                "clientVersion": "21.03.36",
+                "androidSdkVersion": 36,
+                "osName": "Android",
+                "osVersion": "13",
+                "platform": "MOBILE",
+                "clientFormFactor": "SMALL_FORM_FACTOR",
+                "clientScreen": "EMBED",
+                "userAgent": ANDROID_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: Some(json!({"embedUrl": "https://www.youtube.com"})),
+        },
+        InnertubeClient {
+            id: "ios",
+            user_agent: IOS_USER_AGENT,
+            context: json!({
+                "clientName": "iOS",
+                "clientVersion": "20.11.6",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone10,4",
+                "osName": "iOS",
+                "osVersion": "16.7.7.20H330",
+                "platform": "MOBILE",
+                "userAgent": IOS_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+        },
+        InnertubeClient {
+            id: "ios_embedded",
+            user_agent: IOS_USER_AGENT,
+            context: json!({
+                "clientName": "iOS",
+                "clientVersion": "20.11.6",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone10,4",
+                "osName": "iOS",
+                "osVersion": "16.7.7.20H330",
+                "platform": "MOBILE",
+                "clientScreen": "EMBED",
+                "userAgent": IOS_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: Some(json!({"embedUrl": "https://www.youtube.com"})),
+        },
+    ]
+}
+
 #[async_trait]
 impl Router for MediaProxy {
     async fn route(&self, req: Request<()>) -> HandlerResult<HandlerResponse> {
         match req.uri().path() {
             "/healthz" => Ok(self.healthz()),
+            "/resolve" => Ok(self.resolve_source(req).await),
             "/proxy" if req.method() == Method::OPTIONS => Ok(self.options()),
             "/proxy" => Ok(HandlerResponse {
                 status: StatusCode::BAD_REQUEST,
@@ -479,15 +784,17 @@ fn percent_encode_query_component(value: &str) -> String {
     output
 }
 
+fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
 fn target_url(req: &Request<()>) -> Result<Url, String> {
     let query = req.uri().query().unwrap_or_default();
-    let value = query
-        .split('&')
-        .find_map(|pair| {
-            let (key, value) = pair.split_once('=')?;
-            (key == "url").then_some(value)
-        })
-        .ok_or_else(|| "Missing url query parameter".to_string())?;
+    let value =
+        query_param(query, "url").ok_or_else(|| "Missing url query parameter".to_string())?;
     let decoded = percent_decode(value)?;
     Url::parse(&decoded).map_err(|error| format!("Invalid url query parameter: {error}"))
 }
@@ -516,6 +823,85 @@ fn percent_decode(value: &str) -> Result<String, String> {
         }
     }
     String::from_utf8(out).map_err(|_| "URL parameter was not UTF-8".to_string())
+}
+
+fn is_youtube_host(hostname: &str) -> bool {
+    let host = hostname.to_ascii_lowercase();
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+}
+
+fn extract_youtube_id(url: &Url) -> Option<String> {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "youtu.be" || host.ends_with(".youtu.be") {
+        return url
+            .path_segments()
+            .and_then(|mut segments| segments.next())
+            .and_then(clean_youtube_id);
+    }
+    if let Some((_, value)) = url.query_pairs().find(|(key, _)| key == "v") {
+        return clean_youtube_id(&value);
+    }
+    let segments = url.path_segments()?.collect::<Vec<_>>();
+    for prefix in ["shorts", "embed", "live", "v"] {
+        if segments.first().is_some_and(|segment| *segment == prefix) {
+            return segments.get(1).and_then(|value| clean_youtube_id(value));
+        }
+    }
+    None
+}
+
+fn clean_youtube_id(value: &str) -> Option<String> {
+    let id = value
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>();
+    (id.len() == 11).then_some(id)
+}
+
+fn player_response_has_streams(player_response: &Value) -> bool {
+    iter_player_formats(player_response).any(|format| {
+        format
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|mime| mime.starts_with("video/"))
+    })
+}
+
+fn player_response_needs_challenge(player_response: &Value) -> bool {
+    iter_player_formats(player_response).any(format_needs_challenge)
+}
+
+fn iter_player_formats(player_response: &Value) -> impl Iterator<Item = &Value> {
+    player_response
+        .pointer("/streamingData/formats")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            player_response
+                .pointer("/streamingData/adaptiveFormats")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+}
+
+fn format_needs_challenge(format: &Value) -> bool {
+    if format.get("signatureCipher").is_some() || format.get("cipher").is_some() {
+        return true;
+    }
+    let Some(url) = format.get("url").and_then(Value::as_str) else {
+        return false;
+    };
+    Url::parse(url)
+        .ok()
+        .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
 }
 
 fn validate_upstream_url(url: &Url) -> Result<(), String> {
@@ -655,6 +1041,15 @@ fn base_response_headers() -> Vec<(String, String)> {
     vec![
         ("cache-control".to_string(), "no-store".to_string()),
         ("x-handled-by".to_string(), "av-ingest-proxy".to_string()),
+        ("access-control-allow-origin".to_string(), "*".to_string()),
+        (
+            "access-control-allow-methods".to_string(),
+            "GET, HEAD, OPTIONS".to_string(),
+        ),
+        (
+            "access-control-allow-headers".to_string(),
+            "Range, Content-Type, If-Range".to_string(),
+        ),
         (
             "access-control-allow-private-network".to_string(),
             "true".to_string(),

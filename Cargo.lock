@@ -165,6 +165,7 @@ dependencies = [
  "futures-util",
  "http",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

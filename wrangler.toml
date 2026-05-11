@@ -5,9 +5,7 @@ account_id = "c57bb20727aa3564966d2bb693abddce"
 
 routes = [
   { pattern = "wavey.ai/code/av-ingest*", zone_name = "wavey.ai" },
-  { pattern = "wavey.ai/api/av-ingest*", zone_name = "wavey.ai" },
   { pattern = "www.wavey.ai/code/av-ingest*", zone_name = "wavey.ai" },
-  { pattern = "www.wavey.ai/api/av-ingest*", zone_name = "wavey.ai" },
 ]
 
 [assets]

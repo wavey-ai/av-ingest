@@ -2,53 +2,82 @@
 
 Repo: <https://github.com/wavey-ai/av-ingest>
 
-Demo: <https://wavey.ai/code/av-ingest/>
+Demo UI: <https://wavey.ai/code/av-ingest/>
 
-Media proxy health: <https://av-proxy.wavey.ai/healthz>
+Rust API/proxy health: <https://av-proxy.wavey.ai/healthz>
 
 Browser-first audio/video ingest for the scratch.fm frame-selection flow. Paste a
 public URL, load a browser-playable video, play or seek in the browser, pause on
 an exact frame, and copy that frame to a canvas.
 
-The browser owns playback and frame capture. The server side only resolves media
-metadata and streams byte ranges with CORS headers. There is no media storage and
-no server-side transcoding in this path.
+The production split is deliberate:
+
+- Cloudflare serves the demo UI and provides DNS/TLS routing for public domains.
+- Rust on Linode resolves media metadata and proxies media bytes.
+- Cloudflare Workers are not used for YouTube/media proxying.
 
 ## Architecture
 
 - `public/` is the browser UI served at `/code/av-ingest/`.
-- `worker/worker.js` runs on Cloudflare Workers for UI asset serving, direct
-  media proxying, and YouTube metadata resolution at `/api/av-ingest/...`.
-- `crates/extractor` is the small WASM helper used by the browser to classify
-  source URLs and choose browser-playable formats from a YouTube player response.
-- `crates/proxy` is the Rust media proxy for production YouTube media bytes.
-  It uses `web-service` directly and streams `reqwest` chunks to the response
-  writer with range support.
+- `worker/worker.js` is only a tiny Cloudflare asset router for the demo UI.
+  It does not expose `/resolve`, `/proxy`, `/youtube-proxy`, or any media API.
+- `crates/extractor` is the WASM helper used by the browser to classify source
+  URLs and choose browser-playable formats from a YouTube player response.
+- `crates/proxy` is the Rust service deployed on Linode. It owns:
+  - `GET /healthz`
+  - `GET /resolve?url=...`
+  - `GET|HEAD /proxy?url=...`
+  - HLS playlist rewriting so every playlist and segment request stays on the
+    Rust proxy
+  - byte-range forwarding with CORS headers for browser playback and canvas
+    frame capture
 
-Cloudflare Worker egress to `googlevideo.com` currently returns 403 for the media
-byte path, so the hosted UI defaults to `https://av-proxy.wavey.ai` for media
-fetches. Local Wrangler runs still use the same-origin Worker proxy unless you
-pass `?mediaProxy=https://...`.
+`av-proxy.wavey.ai` may still sit behind Cloudflare DNS/TLS, but the request
+handler is the Rust service, not a Worker.
+
+## Browser Decode Path
+
+The browser does the video decoding.
+
+The UI attaches a proxied media URL to an HTML `<video>` element. Safari, Chrome,
+and Firefox then use their native media pipeline to demux and decode the stream,
+usually with hardware acceleration when the codec is supported by the device.
+This repo does not decode video in JavaScript or WASM, does not run ffmpeg in the
+browser, and does not transcode on the server.
+
+Frame selection uses the decoded frame already held by the browser:
+
+```js
+ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+```
+
+For MP4/WebM, the Rust proxy forwards byte ranges so the browser can seek and
+buffer normally. For HLS, the Rust proxy rewrites master playlists, variant
+playlists, and segment URLs to keep all media requests on `av-proxy.wavey.ai`.
 
 ## Supported Inputs
 
 - Direct browser-playable `.mp4`, `.m4v`, `.mov`, `.webm`, `.m3u8`, and `.mpd`
-  URLs through the proxy.
-- Public YouTube URLs when YouTube exposes a browser-playable progressive video
-  format.
-- YouTube `n` and signature challenge solving in a sandboxed browser Worker.
-  Cloudflare fetches metadata and player JavaScript; it does not execute the
-  player script.
+  URLs through the Rust proxy.
+- Public YouTube URLs when YouTube exposes browser-playable progressive MP4
+  formats or native HLS manifests.
 
 SoundCloud resolution is still stubbed. Private, Premium, cookie-gated, DRM, and
 server-transcoded flows are outside this repo.
 
 ## Local UI
 
+Build the WASM helper:
+
 ```bash
 npm install
 npm run build:wasm
-npm run dev
+```
+
+Serve `public/` with any static server:
+
+```bash
+python3 -m http.server 8789 -d public
 ```
 
 Open:
@@ -57,7 +86,8 @@ Open:
 http://127.0.0.1:8789/
 ```
 
-To test the UI against a separate media proxy:
+By default the local UI uses `https://av-proxy.wavey.ai` for `/resolve` and
+`/proxy`. To point it at a local proxy:
 
 ```text
 http://127.0.0.1:8789/?mediaProxy=https://127.0.0.1:8444
@@ -74,16 +104,55 @@ AV_INGEST_PROXY_TLS_KEY_PATH=/path/to/privkey.pem \
 target/release/av-ingest-proxy
 ```
 
-Smoke test:
+Smoke tests:
 
 ```bash
 curl -kfsS https://127.0.0.1:8444/healthz
+
+curl -kfsS \
+  "https://127.0.0.1:8444/resolve?url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3D6HMs7eoQkFw" \
+  -o /tmp/resolve.json
 
 encoded_url="$(node -e 'console.log(encodeURIComponent(process.argv[1]))' \
   'https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4')"
 curl -kfsS -H 'Range: bytes=0-1023' \
   "https://127.0.0.1:8444/proxy?url=${encoded_url}" \
   -o /tmp/flower.bin
+```
+
+## Cloudflare UI Deploy
+
+Cloudflare is only used for the demo UI route in this repo:
+
+```bash
+CLOUDFLARE_EMAIL=jamie@wavey.ai \
+CLOUDFLARE_API_KEY="$(tr -d '\n\r' < /Users/jamie/wavey.ai/.cloudflare-token)" \
+npx wrangler deploy
+```
+
+The Wrangler config routes only:
+
+```text
+wavey.ai/code/av-ingest*
+www.wavey.ai/code/av-ingest*
+```
+
+There is no Cloudflare Worker media proxy route.
+
+## Linode Deploy
+
+The Rust proxy is the API/media service. The Linode installer builds the proxy,
+installs a systemd service, and configures the public host:
+
+```bash
+deploy/linode/install-proxy.sh root@203.0.113.10 av-proxy.wavey.ai
+```
+
+The current live tunnel can also point `av-proxy.wavey.ai` at a local Rust proxy
+while iterating:
+
+```bash
+cloudflared tunnel --config .cloudflared/config.yml run
 ```
 
 ## Checks
@@ -103,61 +172,18 @@ https://www.youtube.com/watch?v=dQw4w9WgXcQ
 https://www.youtube.com/watch?v=6HMs7eoQkFw
 ```
 
-## Current Measurements
+## `web-service`
 
-Measured locally on May 11, 2026 with a live YouTube `itag=18` media URL resolved
-by the deployed Worker. Payload size was `7,232,158` bytes.
+The Rust proxy uses the `web-service` crate and should continue to do so. This
+service is a streaming/range proxy: requests arrive, the Rust service opens an
+upstream `reqwest` stream, and chunks are written directly to the response via
+`StreamWriter`.
 
-| Path | Runs | Status | Avg Time | Median Time | Notes |
-| --- | ---: | --- | ---: | ---: | --- |
-| Rust proxy, full object | 5 | 200 | 3.13 s | 2.92 s | Browser path uses this in production |
-| Direct full object | 5 | 200 | 3.46 s | 3.75 s | Baseline from the same local network |
-| Rust proxy, 1 KB range | 1 | 206 | n/a | n/a | Returned `Content-Range` and exactly 1024 bytes |
-| Cloudflare Worker googlevideo probe | repeated | 403 | n/a | n/a | Reason for the Rust proxy |
+`upload-response` is not used here. It is useful when a request body must be
+handed to another local or remote worker and that worker's eventual response
+must be bridged back. This proxy has no worker stage and no request body to
+cache, so direct `web-service` routing avoids extra buffering, polling, and body
+copies.
 
-The proxy binary built on macOS was `9.9 MB`. The production container is a
-single Rust process on Debian slim with no Python runtime.
-
-## Deployment
-
-UI and Worker:
-
-```bash
-CLOUDFLARE_EMAIL=jamie@wavey.ai \
-CLOUDFLARE_API_KEY="$(tr -d '\n\r' < /Users/jamie/wavey.ai/.cloudflare-token)" \
-npx wrangler deploy
-```
-
-Rust media proxy, intended permanent path:
-
-```bash
-gh workflow run deploy-av-ingest-proxy.yml \
-  -R wavey-ai/bitneedle \
-  -f av_ingest_ref=main
-```
-
-The proxy workflow lives in `wavey-ai/bitneedle` because the kubeadm and
-Cloudflare deployment secrets are already attached to that repo. It builds
-`ghcr.io/wavey-ai/av-ingest-proxy`, deploys the Kubernetes manifests under
-`deploy/k8s/av-ingest-proxy`, creates `av-proxy.wavey.ai`, and verifies health
-plus a byte-range media fetch.
-
-Current live proxy:
-
-```bash
-cloudflared tunnel --config .cloudflared/config.yml run
-```
-
-This points `av-proxy.wavey.ai` at the local Rust proxy through Cloudflare
-Tunnel. It is useful while the bitneedle GitHub Actions runner path is returning
-`startup_failure` before jobs are scheduled.
-
-## upload-response
-
-`upload-response` is not used for the media proxy. It is the right abstraction
-when an ingress stream needs to be handed to local or remote workers and a later
-worker response must be bridged back to the client.
-
-For this service there is no worker stage and no request body to cache. The fast
-path is direct `web-service` routing plus upstream `reqwest` streaming, which
-avoids cache-slot allocation, polling, and extra body copies.
+The proxy binary is a single Rust process. There is no Python runtime dependency
+in production.
