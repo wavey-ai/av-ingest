@@ -1,4 +1,5 @@
 .cloudflared/
+.run/
 .wrangler/
 node_modules/
 target/
