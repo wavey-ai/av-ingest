@@ -214,6 +214,10 @@ impl MediaProxy {
     fn new(user_agent: String, ytdlp: YtDlpConfig, resolve_mode: ResolveMode) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .pool_idle_timeout(Duration::from_secs(120))
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_while_idle(true)
@@ -921,6 +925,7 @@ impl MediaProxy {
             let mut upstream = self
                 .client
                 .request(method.clone(), upstream_url.clone())
+                .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .header(reqwest::header::USER_AGENT, &self.user_agent);
 
             for name in [
