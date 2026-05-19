@@ -110,11 +110,16 @@ AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS=45
 AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS='youtube:player_client=mweb'
 AV_INGEST_PROXY_YTDLP_COOKIES=/path/to/cookies.txt
 AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER=chrome
+AV_INGEST_PROXY_RESOLVE_MODE=transcribe
 ```
 
 When YouTube requires GVS PO tokens, configure `yt-dlp` the same way you would on
 the command line, for example through `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` and
 an installed `yt-dlp` PO-token provider plugin.
+
+Use `AV_INGEST_PROXY_RESOLVE_MODE=transcribe` for ASR-only jobs. `/resolve`
+then returns audio-only formats when YouTube provides them. If no audio-only
+format is available, it keeps only the smallest muxed audio/video format.
 
 ## Notes
 
