@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
@@ -141,11 +141,53 @@ impl AppConfig {
     }
 }
 
+#[derive(Clone)]
 struct MediaProxy {
     client: reqwest::Client,
     user_agent: String,
     ytdlp: YtDlpConfig,
     resolve_mode: ResolveMode,
+}
+
+#[derive(Clone)]
+pub struct TranscribeAudioResolver {
+    proxy: MediaProxy,
+}
+
+pub struct TranscribeAudioStream {
+    pub source_url: Url,
+    pub duration_seconds: Option<u64>,
+    pub resolver: String,
+    pub itag: Option<u64>,
+    pub mime_type: Option<String>,
+    response: reqwest::Response,
+}
+
+impl TranscribeAudioResolver {
+    pub fn from_env() -> Result<Self> {
+        let config = AppConfig::from_env()?;
+        Ok(Self {
+            proxy: MediaProxy::new(config.user_agent, config.ytdlp, config.resolve_mode)?,
+        })
+    }
+
+    pub async fn open_youtube_audio(&self, source: &str) -> Result<TranscribeAudioStream> {
+        let source_url =
+            Url::parse(source).with_context(|| format!("invalid YouTube source URL: {source}"))?;
+        self.proxy
+            .open_youtube_transcribe_audio(source_url, &Method::GET, &HeaderMap::new())
+            .await
+    }
+}
+
+impl TranscribeAudioStream {
+    pub fn response(&self) -> &reqwest::Response {
+        &self.response
+    }
+
+    pub fn into_response(self) -> reqwest::Response {
+        self.response
+    }
 }
 
 struct ExtractedFrameImage {
@@ -158,6 +200,14 @@ struct FrameMediaSource {
     url: Url,
     headers: Vec<(String, String)>,
     resolver: String,
+}
+
+#[derive(Clone, Debug)]
+struct TranscribeMediaSource {
+    url: Url,
+    resolver: String,
+    itag: Option<u64>,
+    mime_type: Option<String>,
 }
 
 impl MediaProxy {
@@ -493,6 +543,58 @@ impl MediaProxy {
         Ok(ExtractedFrameImage {
             bytes,
             content_type: "image/png",
+        })
+    }
+
+    async fn open_youtube_transcribe_audio(
+        &self,
+        source_url: Url,
+        method: &Method,
+        headers: &HeaderMap,
+    ) -> Result<TranscribeAudioStream> {
+        anyhow::ensure!(
+            is_youtube_host(source_url.host_str().unwrap_or_default()),
+            "Only YouTube audio sources are implemented."
+        );
+        let video_id = extract_youtube_id(&source_url)
+            .ok_or_else(|| anyhow::anyhow!("Could not extract YouTube video id."))?;
+
+        let (resolver, mut player_response, _attempts) = self
+            .fetch_best_innertube_player_response(&video_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("YouTube resolve failed: {error}"))?;
+        apply_transcribe_resolve_mode(&mut player_response);
+        let media_source = select_transcribe_media_source(&player_response, &resolver)
+            .ok_or_else(|| anyhow::anyhow!(ResolveMode::Transcribe.empty_formats_error()))?;
+        let duration_seconds = player_response
+            .pointer("/videoDetails/lengthSeconds")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok());
+
+        debug!(
+            source = %source_url,
+            upstream = %media_source.url,
+            resolver = %media_source.resolver,
+            itag = media_source.itag,
+            "selected transcribe media stream"
+        );
+
+        let response = self
+            .fetch_upstream(method, headers, media_source.url)
+            .await
+            .map_err(|error| match error {
+                ProxyFetchError::Forbidden(error) | ProxyFetchError::BadGateway(error) => {
+                    anyhow::anyhow!(error)
+                }
+            })?;
+
+        Ok(TranscribeAudioStream {
+            source_url,
+            duration_seconds,
+            resolver: media_source.resolver,
+            itag: media_source.itag,
+            mime_type: media_source.mime_type,
+            response,
         })
     }
 
@@ -1444,6 +1546,43 @@ fn transcribe_fallback_score(format: &Value) -> (u64, u64, u64) {
     let bitrate = format_u64(format, "bitrate").unwrap_or(u64::MAX);
     let content_length = format_u64(format, "contentLength").unwrap_or(u64::MAX);
     (pixels, bitrate, content_length)
+}
+
+fn select_transcribe_media_source(
+    player_response: &Value,
+    resolver: &str,
+) -> Option<TranscribeMediaSource> {
+    iter_player_formats(player_response)
+        .filter(|format| format_has_audio(format))
+        .filter_map(|format| {
+            let url = format.get("url").and_then(Value::as_str)?;
+            let url = Url::parse(url).ok()?;
+            Some((
+                transcribe_media_score(format),
+                TranscribeMediaSource {
+                    url,
+                    resolver: resolver.to_string(),
+                    itag: format_u64(format, "itag"),
+                    mime_type: format
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                },
+            ))
+        })
+        .min_by_key(|(score, _source)| *score)
+        .map(|(_score, source)| source)
+}
+
+fn transcribe_media_score(format: &Value) -> (u8, u64, u64, u64) {
+    let audio_only = is_audio_only_format(format);
+    let pixels = format_u64(format, "width")
+        .zip(format_u64(format, "height"))
+        .map(|(width, height)| width.saturating_mul(height))
+        .unwrap_or(0);
+    let content_length = format_u64(format, "contentLength").unwrap_or(u64::MAX);
+    let bitrate = format_u64(format, "bitrate").unwrap_or(u64::MAX);
+    ((!audio_only) as u8, pixels, content_length, bitrate)
 }
 
 fn format_u64(format: &Value, key: &str) -> Option<u64> {
