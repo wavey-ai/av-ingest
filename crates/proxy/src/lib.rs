@@ -1574,7 +1574,7 @@ fn select_transcribe_media_source(
         .map(|(_score, source)| source)
 }
 
-fn transcribe_media_score(format: &Value) -> (u8, u64, u64, u64) {
+fn transcribe_media_score(format: &Value) -> (u8, u8, u64, u64, u64) {
     let audio_only = is_audio_only_format(format);
     let pixels = format_u64(format, "width")
         .zip(format_u64(format, "height"))
@@ -1582,7 +1582,30 @@ fn transcribe_media_score(format: &Value) -> (u8, u64, u64, u64) {
         .unwrap_or(0);
     let content_length = format_u64(format, "contentLength").unwrap_or(u64::MAX);
     let bitrate = format_u64(format, "bitrate").unwrap_or(u64::MAX);
-    ((!audio_only) as u8, pixels, content_length, bitrate)
+    (
+        (!audio_only) as u8,
+        transcribe_codec_score(format),
+        pixels,
+        content_length,
+        bitrate,
+    )
+}
+
+fn transcribe_codec_score(format: &Value) -> u8 {
+    let mime = format
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if mime.contains("webm") && mime.contains("opus") {
+        0
+    } else if mime.contains("mp4a.40.2") {
+        1
+    } else if mime.contains("mp4a") {
+        2
+    } else {
+        3
+    }
 }
 
 fn format_u64(format: &Value, key: &str) -> Option<u64> {
@@ -2345,6 +2368,35 @@ mod tests {
         assert!(formats.is_empty());
         assert_eq!(adaptive.len(), 1);
         assert_eq!(adaptive[0].get("itag").and_then(Value::as_i64), Some(140));
+    }
+
+    #[test]
+    fn transcribe_media_source_prefers_streaming_safe_opus() {
+        let value = json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "itag": 139,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=139",
+                        "mimeType": "audio/mp4; codecs=\"mp4a.40.5\"",
+                        "audioQuality": "AUDIO_QUALITY_LOW",
+                        "contentLength": "1000",
+                        "bitrate": 48000
+                    },
+                    {
+                        "itag": 251,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=251",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM",
+                        "contentLength": "2000",
+                        "bitrate": 128000
+                    }
+                ]
+            }
+        });
+
+        let source = select_transcribe_media_source(&value, "test").unwrap();
+        assert_eq!(source.itag, Some(251));
     }
 
     #[test]
