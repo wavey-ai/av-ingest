@@ -53,6 +53,10 @@ spec:
               value: /var/run/av-ingest-proxy/tls/tls.crt
             - name: AV_INGEST_PROXY_TLS_KEY_PATH
               value: /var/run/av-ingest-proxy/tls/tls.key
+            - name: AV_INGEST_PROXY_YTDLP_PATH
+              value: /usr/local/bin/yt-dlp
+            - name: AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS
+              value: "45"
           volumeMounts:
             - name: proxy-tls
               mountPath: /var/run/av-ingest-proxy/tls

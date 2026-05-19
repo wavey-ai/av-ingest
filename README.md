@@ -10,7 +10,7 @@ stream; `/frame` can use the highest-resolution source stream.
 ## Requirements
 
 ```bash
-brew install libvpx pkg-config
+brew install libvpx pkg-config yt-dlp
 ```
 
 You also need Rust/Cargo.
@@ -53,6 +53,10 @@ for playback and seeking.
 timestamp. It selects a high-resolution WebM/VP9 stream, seeks by WebM cues,
 decodes with `libvpx`, and returns PNG.
 
+For YouTube frame extraction, the proxy first asks `yt-dlp` for current format
+URLs and uses the selected format's `http_headers` for every native range fetch.
+If that fails, it falls back to the built-in InnerTube resolver.
+
 ## Smoke tests
 
 ```bash
@@ -90,12 +94,27 @@ curl -fsS \
 
 Native path:
 
-1. Resolve source streams.
+1. Resolve source streams with `yt-dlp`, including per-format HTTP headers.
 2. Pick the best WebM/VP9 video stream.
 3. Fetch enough bytes to parse WebM metadata and cues.
 4. Range-fetch the cluster around `ts_us`.
 5. Decode VP9 with `libvpx`.
 6. Return PNG.
+
+Useful environment variables:
+
+```bash
+AV_INGEST_PROXY_YTDLP_ENABLED=1
+AV_INGEST_PROXY_YTDLP_PATH=yt-dlp
+AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS=45
+AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS='youtube:player_client=mweb'
+AV_INGEST_PROXY_YTDLP_COOKIES=/path/to/cookies.txt
+AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER=chrome
+```
+
+When YouTube requires GVS PO tokens, configure `yt-dlp` the same way you would on
+the command line, for example through `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` and
+an installed `yt-dlp` PO-token provider plugin.
 
 ## Notes
 

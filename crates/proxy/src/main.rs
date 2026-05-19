@@ -13,12 +13,15 @@ use hyper_util::rt::TokioIo;
 use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, TcpListener};
+use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use web_service::{
@@ -45,6 +48,17 @@ struct AppConfig {
     cert_path: Option<String>,
     key_path: Option<String>,
     user_agent: String,
+    ytdlp: YtDlpConfig,
+}
+
+#[derive(Clone)]
+struct YtDlpConfig {
+    enabled: bool,
+    path: String,
+    extractor_args: Option<String>,
+    cookies: Option<String>,
+    cookies_from_browser: Option<String>,
+    timeout: Duration,
 }
 
 impl AppConfig {
@@ -57,6 +71,15 @@ impl AppConfig {
             key_path: env::var("AV_INGEST_PROXY_TLS_KEY_PATH").ok(),
             user_agent: env::var("AV_INGEST_PROXY_USER_AGENT")
                 .unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string()),
+            ytdlp: YtDlpConfig {
+                enabled: env_bool("AV_INGEST_PROXY_YTDLP_ENABLED", true),
+                path: env::var("AV_INGEST_PROXY_YTDLP_PATH")
+                    .unwrap_or_else(|_| "yt-dlp".to_string()),
+                extractor_args: env_nonempty("AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS"),
+                cookies: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES"),
+                cookies_from_browser: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER"),
+                timeout: Duration::from_secs(env_u64("AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS", 45)?),
+            },
         })
     }
 
@@ -81,6 +104,7 @@ impl AppConfig {
 struct MediaProxy {
     client: reqwest::Client,
     user_agent: String,
+    ytdlp: YtDlpConfig,
 }
 
 struct ExtractedFrameImage {
@@ -88,8 +112,15 @@ struct ExtractedFrameImage {
     content_type: &'static str,
 }
 
+#[derive(Clone, Debug)]
+struct FrameMediaSource {
+    url: Url,
+    headers: Vec<(String, String)>,
+    resolver: String,
+}
+
 impl MediaProxy {
-    fn new(user_agent: String) -> Result<Self> {
+    fn new(user_agent: String, ytdlp: YtDlpConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(120))
@@ -99,7 +130,11 @@ impl MediaProxy {
             .tcp_keepalive(Duration::from_secs(60))
             .build()
             .context("failed to build upstream HTTP client")?;
-        Ok(Self { client, user_agent })
+        Ok(Self {
+            client,
+            user_agent,
+            ytdlp,
+        })
     }
 
     fn healthz(&self) -> HandlerResponse {
@@ -279,7 +314,7 @@ impl MediaProxy {
             }
         };
 
-        let media_url = if is_youtube_host(source_url.host_str().unwrap_or_default()) {
+        let media_source = if is_youtube_host(source_url.host_str().unwrap_or_default()) {
             let Some(video_id) = extract_youtube_id(&source_url) else {
                 return self.text_response(
                     StatusCode::BAD_REQUEST,
@@ -287,45 +322,74 @@ impl MediaProxy {
                 );
             };
             debug!(%video_id, ts_us, "resolving youtube source for frame extraction");
-            match self.fetch_best_innertube_player_response(&video_id).await {
-                Ok((resolver, player_response, attempts)) => {
+            match self.resolve_ytdlp_frame_source(source_url.as_str()).await {
+                Ok(source) => {
                     debug!(
                         %video_id,
-                        %resolver,
-                        attempts = attempts.len(),
-                        "youtube source resolved for frame extraction"
+                        resolver = %source.resolver,
+                        host = source.url.host_str().unwrap_or(""),
+                        headers = source.headers.len(),
+                        "yt-dlp source resolved for frame extraction"
                     );
-                    match select_best_frame_media_url(&player_response) {
-                        Some(url) => {
-                            debug!(%url, "selected native frame media url");
-                            url
-                        }
-                        None => return self.text_response(
-                            StatusCode::BAD_GATEWAY,
-                            "No direct YouTube video stream was available for frame extraction.",
-                        ),
-                    }
+                    source
                 }
-                Err(error) => {
-                    warn!(%video_id, %error, "youtube resolve failed for frame extraction");
-                    return self.text_response(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("YouTube resolve failed: {error}"),
-                    )
+                Err(ytdlp_error) => {
+                    warn!(
+                        %video_id,
+                        error = %ytdlp_error,
+                        "yt-dlp frame source failed; falling back to InnerTube"
+                    );
+                    match self.fetch_best_innertube_player_response(&video_id).await {
+                        Ok((resolver, player_response, attempts)) => {
+                            debug!(
+                                %video_id,
+                                %resolver,
+                                attempts = attempts.len(),
+                                "youtube source resolved for frame extraction"
+                            );
+                            match select_best_innertube_frame_media_source(&player_response, &resolver) {
+                                Some(source) => {
+                                    debug!(
+                                        host = source.url.host_str().unwrap_or(""),
+                                        resolver = %source.resolver,
+                                        "selected native frame media url"
+                                    );
+                                    source
+                                }
+                                None => return self.text_response(
+                                    StatusCode::BAD_GATEWAY,
+                                    "No direct YouTube video stream was available for frame extraction.",
+                                ),
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%video_id, %error, "youtube resolve failed for frame extraction");
+                            return self.text_response(
+                                StatusCode::BAD_GATEWAY,
+                                &format!(
+                                    "YouTube resolve failed: {error}; yt-dlp failed first: {ytdlp_error}"
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         } else {
-            source_url
+            FrameMediaSource {
+                url: source_url,
+                headers: Vec::new(),
+                resolver: "direct".to_string(),
+            }
         };
 
-        if let Err(error) = validate_upstream_url(&media_url) {
+        if let Err(error) = validate_upstream_url(&media_source.url) {
             return self.text_response(StatusCode::FORBIDDEN, &error);
         }
-        if let Err(error) = validate_resolved_upstream_host(&media_url).await {
+        if let Err(error) = validate_resolved_upstream_host(&media_source.url).await {
             return self.text_response(StatusCode::FORBIDDEN, &error);
         }
 
-        match self.extract_frame_image(media_url.as_str(), ts_us).await {
+        match self.extract_frame_image(&media_source, ts_us).await {
             Ok(image) => {
                 debug!(
                     bytes = image.bytes.len(),
@@ -357,14 +421,21 @@ impl MediaProxy {
 
     async fn extract_frame_image(
         &self,
-        media_url: &str,
+        media_source: &FrameMediaSource,
         ts_us: u64,
     ) -> Result<ExtractedFrameImage, String> {
-        debug!(%media_url, ts_us, "starting native frame extraction");
+        debug!(
+            resolver = %media_source.resolver,
+            host = media_source.url.host_str().unwrap_or(""),
+            headers = media_source.headers.len(),
+            ts_us,
+            "starting native frame extraction"
+        );
         let bytes = native_frame::extract_vp9_webm_frame_png(
             &self.client,
             &self.user_agent,
-            media_url,
+            media_source.url.as_str(),
+            &media_source.headers,
             ts_us,
         )
         .await?;
@@ -624,6 +695,62 @@ impl MediaProxy {
             .json::<Value>()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    async fn resolve_ytdlp_frame_source(
+        &self,
+        source_url: &str,
+    ) -> Result<FrameMediaSource, String> {
+        if !self.ytdlp.enabled {
+            return Err("yt-dlp resolver is disabled".to_string());
+        }
+
+        let mut command = Command::new(&self.ytdlp.path);
+        command
+            .arg("--dump-single-json")
+            .arg("--no-playlist")
+            .arg("--no-warnings")
+            .arg("--skip-download")
+            .arg("--no-progress");
+        if let Some(extractor_args) = &self.ytdlp.extractor_args {
+            command.arg("--extractor-args").arg(extractor_args);
+        }
+        if let Some(cookies) = &self.ytdlp.cookies {
+            command.arg("--cookies").arg(cookies);
+        }
+        if let Some(cookies_from_browser) = &self.ytdlp.cookies_from_browser {
+            command
+                .arg("--cookies-from-browser")
+                .arg(cookies_from_browser);
+        }
+        command
+            .arg(source_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = tokio::time::timeout(self.ytdlp.timeout, command.output())
+            .await
+            .map_err(|_| format!("yt-dlp timed out after {:?}", self.ytdlp.timeout))?
+            .map_err(|error| format!("yt-dlp could not start: {error}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "yt-dlp exited with {}{}",
+                output.status,
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            ));
+        }
+
+        let value = serde_json::from_slice::<Value>(&output.stdout)
+            .map_err(|error| format!("yt-dlp JSON parse failed: {error}"))?;
+        select_best_ytdlp_frame_media_source(&value)
+            .ok_or_else(|| "yt-dlp returned no VP9 WebM video-only format".to_string())
     }
 
     async fn fetch_upstream(
@@ -1179,7 +1306,10 @@ fn iter_player_formats(player_response: &Value) -> impl Iterator<Item = &Value> 
         )
 }
 
-fn select_best_frame_media_url(player_response: &Value) -> Option<Url> {
+fn select_best_innertube_frame_media_source(
+    player_response: &Value,
+    resolver: &str,
+) -> Option<FrameMediaSource> {
     iter_player_formats(player_response)
         .filter_map(|format| {
             if !is_native_frame_format(format) {
@@ -1187,10 +1317,17 @@ fn select_best_frame_media_url(player_response: &Value) -> Option<Url> {
             }
             let url = format.get("url").and_then(Value::as_str)?;
             let parsed = Url::parse(url).ok()?;
-            Some((frame_format_score(format), parsed))
+            Some((
+                frame_format_score(format),
+                FrameMediaSource {
+                    url: parsed,
+                    headers: Vec::new(),
+                    resolver: resolver.to_string(),
+                },
+            ))
         })
-        .max_by_key(|(score, _url)| *score)
-        .map(|(_score, url)| url)
+        .max_by_key(|(score, _source)| *score)
+        .map(|(_score, source)| source)
 }
 
 fn is_native_frame_format(format: &Value) -> bool {
@@ -1237,6 +1374,129 @@ fn format_needs_challenge(format: &Value) -> bool {
     Url::parse(url)
         .ok()
         .is_some_and(|url| url.query_pairs().any(|(key, _)| key == "n"))
+}
+
+fn select_best_ytdlp_frame_media_source(root: &Value) -> Option<FrameMediaSource> {
+    let candidates: Vec<(&Value, &Value)> = if root.get("formats").is_some() {
+        vec![(root, root)]
+    } else {
+        root.get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|entry| (entry, entry))
+            .collect()
+    };
+
+    candidates
+        .into_iter()
+        .flat_map(|(video, entry)| {
+            entry
+                .get("formats")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |format| {
+                    if !is_ytdlp_native_frame_format(format) {
+                        return None;
+                    }
+                    let url = format.get("url").and_then(Value::as_str)?;
+                    let parsed = Url::parse(url).ok()?;
+                    Some((
+                        ytdlp_frame_format_score(format),
+                        FrameMediaSource {
+                            url: parsed,
+                            headers: collect_ytdlp_http_headers(video, format),
+                            resolver: "yt-dlp".to_string(),
+                        },
+                    ))
+                })
+        })
+        .max_by_key(|(score, _source)| *score)
+        .map(|(_score, source)| source)
+}
+
+fn is_ytdlp_native_frame_format(format: &Value) -> bool {
+    let protocol = format
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !protocol.is_empty() && protocol != "https" && protocol != "http" {
+        return false;
+    }
+
+    let ext = format
+        .get("ext")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let vcodec = format
+        .get("vcodec")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let acodec = format
+        .get("acodec")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let url = format.get("url").and_then(Value::as_str).unwrap_or("");
+
+    !url.is_empty()
+        && ext == "webm"
+        && (vcodec.contains("vp9") || vcodec.contains("vp09"))
+        && (acodec.is_empty() || acodec == "none")
+}
+
+fn ytdlp_frame_format_score(format: &Value) -> i64 {
+    let width = format
+        .get("width")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let height = format
+        .get("height")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let bitrate = format
+        .get("tbr")
+        .or_else(|| format.get("vbr"))
+        .or_else(|| format.get("abr"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0)
+        .max(0.0)
+        .round() as i64;
+
+    width
+        .saturating_mul(height)
+        .saturating_add(bitrate.min(100_000))
+}
+
+fn collect_ytdlp_http_headers(video: &Value, format: &Value) -> Vec<(String, String)> {
+    let mut headers = BTreeMap::<String, (String, String)>::new();
+    merge_ytdlp_http_headers(&mut headers, video.get("http_headers"));
+    merge_ytdlp_http_headers(&mut headers, format.get("http_headers"));
+    headers.into_values().collect()
+}
+
+fn merge_ytdlp_http_headers(
+    headers: &mut BTreeMap<String, (String, String)>,
+    value: Option<&Value>,
+) {
+    let Some(object) = value.and_then(Value::as_object) else {
+        return;
+    };
+    for (name, value) in object {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        headers.insert(name.to_ascii_lowercase(), (name.clone(), value.to_string()));
+    }
 }
 
 fn validate_upstream_url(url: &Url) -> Result<(), String> {
@@ -1423,11 +1683,27 @@ fn env_bool(name: &str, default: bool) -> bool {
     }
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn env_u16(name: &str, default: u16) -> Result<u16> {
     match env::var(name) {
         Ok(value) => value
             .parse::<u16>()
             .with_context(|| format!("failed to parse {name}={value} as u16")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("failed to parse {name}={value} as u64")),
         Err(_) => Ok(default),
     }
 }
@@ -1648,12 +1924,18 @@ async fn main() -> Result<()> {
 
     let config = AppConfig::from_env()?;
     if config.local_http {
-        let router = Arc::new(MediaProxy::new(config.user_agent.clone())?);
+        let router = Arc::new(MediaProxy::new(
+            config.user_agent.clone(),
+            config.ytdlp.clone(),
+        )?);
         return run_plain_http_server(config.port, router).await;
     }
 
     let (cert, key) = config.tls_base64()?;
-    let router = Box::new(MediaProxy::new(config.user_agent.clone())?);
+    let router = Box::new(MediaProxy::new(
+        config.user_agent.clone(),
+        config.ytdlp.clone(),
+    )?);
     let server = H2H3Server::builder()
         .with_tls(cert, key)
         .with_port(config.port)
@@ -1735,5 +2017,60 @@ mod tests {
         assert!(rewritten.contains("#EXT-X-MAP:URI=\"/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Finit.mp4\""));
         assert!(rewritten.contains("/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Fseg-1.m4s"));
         assert!(rewritten.contains("/proxy?url=https%3A%2F%2Frr1---sn.googlevideo.com%2Fvideoplayback%3Fid%3D1%26itag%3D137"));
+    }
+
+    #[test]
+    fn selects_ytdlp_vp9_webm_and_merges_format_headers() {
+        let value = json!({
+            "http_headers": {
+                "User-Agent": "global-agent",
+                "Accept-Language": "en-US"
+            },
+            "formats": [
+                {
+                    "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=137",
+                    "ext": "mp4",
+                    "vcodec": "avc1.640028",
+                    "acodec": "none",
+                    "width": 1920,
+                    "height": 1080
+                },
+                {
+                    "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=248",
+                    "ext": "webm",
+                    "vcodec": "vp9",
+                    "acodec": "none",
+                    "width": 1920,
+                    "height": 1080,
+                    "http_headers": {
+                        "User-Agent": "format-agent",
+                        "Referer": "https://www.youtube.com/"
+                    }
+                }
+            ]
+        });
+
+        let selected = select_best_ytdlp_frame_media_source(&value).unwrap();
+        assert_eq!(
+            selected
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "itag")
+                .unwrap()
+                .1,
+            "248"
+        );
+        assert!(selected
+            .headers
+            .iter()
+            .any(|(name, value)| name == "User-Agent" && value == "format-agent"));
+        assert!(selected
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Accept-Language" && value == "en-US"));
+        assert!(selected
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Referer" && value == "https://www.youtube.com/"));
     }
 }

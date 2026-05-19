@@ -13,8 +13,10 @@ RUN cargo build --release -p av-ingest-proxy
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates curl python3 \
   && rm -rf /var/lib/apt/lists/* \
+  && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+  && chmod 0755 /usr/local/bin/yt-dlp \
   && useradd --system --home-dir /var/lib/av-ingest-proxy --create-home --shell /usr/sbin/nologin av-ingest-proxy
 
 COPY --from=build /src/target/release/av-ingest-proxy /usr/local/bin/av-ingest-proxy

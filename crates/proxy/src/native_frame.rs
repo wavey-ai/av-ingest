@@ -1,6 +1,6 @@
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ExtendedColorType, ImageEncoder};
-use reqwest::header::{CONTENT_RANGE, RANGE, USER_AGENT};
+use reqwest::header::{HeaderName, HeaderValue, CONTENT_RANGE, RANGE, USER_AGENT};
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -109,13 +109,19 @@ pub async fn extract_vp9_webm_frame_png(
     client: &reqwest::Client,
     user_agent: &str,
     media_url: &str,
+    headers: &[(String, String)],
     target_us: u64,
 ) -> Result<Vec<u8>, String> {
-    debug!(target_us, %media_url, "native vp9 webm frame extraction started");
+    debug!(
+        target_us,
+        media_host = media_url_host(media_url),
+        "native vp9 webm frame extraction started"
+    );
     let head = fetch_range(
         client,
         user_agent,
         media_url,
+        headers,
         0,
         Some(INITIAL_INDEX_RANGE_BYTES - 1),
     )
@@ -156,8 +162,15 @@ pub async fn extract_vp9_webm_frame_png(
                 .saturating_add(MAX_CUES_RANGE_BYTES)
                 .saturating_sub(1);
             debug!(cues_start, cues_end, "fetching webm cues range");
-            let cues_range =
-                fetch_range(client, user_agent, media_url, cues_start, Some(cues_end)).await?;
+            let cues_range = fetch_range(
+                client,
+                user_agent,
+                media_url,
+                headers,
+                cues_start,
+                Some(cues_end),
+            )
+            .await?;
             if cues_range.start != cues_start {
                 return Err(format!(
                     "cues range started at byte {}, expected {cues_start}",
@@ -210,6 +223,7 @@ pub async fn extract_vp9_webm_frame_png(
         client,
         user_agent,
         media_url,
+        headers,
         cluster_start,
         Some(cluster_end),
     )
@@ -251,6 +265,7 @@ async fn fetch_range(
     client: &reqwest::Client,
     user_agent: &str,
     media_url: &str,
+    headers: &[(String, String)],
     start: u64,
     end: Option<u64>,
 ) -> Result<RangeFetch, String> {
@@ -258,11 +273,28 @@ async fn fetch_range(
         Some(end) => format!("bytes={start}-{end}"),
         None => format!("bytes={start}-"),
     };
-    trace!(%range, %media_url, "native frame range fetch request");
-    let response = client
+    trace!(
+        %range,
+        media_host = media_url_host(media_url),
+        "native frame range fetch request"
+    );
+    let mut request = client
         .get(media_url)
         .header(USER_AGENT, user_agent)
-        .header(RANGE, range.as_str())
+        .header(RANGE, range.as_str());
+    for (name, value) in headers {
+        if should_skip_upstream_header(name) {
+            continue;
+        }
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        request = request.header(header_name, header_value);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("native range fetch failed: {error}"))?;
@@ -305,6 +337,20 @@ async fn fetch_range(
         bytes: bytes.to_vec(),
         total_len: parsed_range.2,
     })
+}
+
+fn should_skip_upstream_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection" | "content-length" | "host" | "range" | "transfer-encoding"
+    )
+}
+
+fn media_url_host(media_url: &str) -> String {
+    reqwest::Url::parse(media_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn parse_content_range_header(value: &str) -> Option<(u64, u64, Option<u64>)> {
@@ -672,9 +718,7 @@ fn decode_target_frame_to_png(frames: &[Vp9Frame], target_us: u64) -> Result<Vec
         let absolute_index = start_index + relative_index;
         let next_time_us = frames.get(absolute_index + 1).map(|next| next.time_us);
         let should_capture_rgba = frame.time_us >= target_us
-            || next_time_us
-                .map(|next| next >= target_us)
-                .unwrap_or(true);
+            || next_time_us.map(|next| next >= target_us).unwrap_or(true);
         trace!(
             frame_time_us = frame.time_us,
             keyframe = frame.keyframe,
