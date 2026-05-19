@@ -4,8 +4,15 @@ use reqwest::header::{CONTENT_RANGE, RANGE, USER_AGENT};
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 use std::ptr;
+use tracing::{debug, trace};
 
-#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    unused_imports,
+    dead_code
+)]
 mod vpx {
     include!(concat!(env!("OUT_DIR"), "/vpx_bindings.rs"));
 }
@@ -23,9 +30,6 @@ const TRACK_ENTRY_ID: u32 = 0xAE;
 const TRACK_NUMBER_ID: u32 = 0xD7;
 const TRACK_TYPE_ID: u32 = 0x83;
 const CODEC_ID_ID: u32 = 0x86;
-const VIDEO_ID: u32 = 0xE0;
-const PIXEL_WIDTH_ID: u32 = 0xB0;
-const PIXEL_HEIGHT_ID: u32 = 0xBA;
 const CLUSTER_ID: u32 = 0x1F43B675;
 const CLUSTER_TIMECODE_ID: u32 = 0xE7;
 const SIMPLE_BLOCK_ID: u32 = 0xA3;
@@ -58,8 +62,6 @@ struct Element {
 struct VideoTrack {
     number: u64,
     codec_id: String,
-    width: u64,
-    height: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +99,6 @@ impl Default for WebmIndex {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ParsedWebm {
-    video_track: VideoTrack,
-    frames: Vec<Vp9Frame>,
-}
-
 struct RangeFetch {
     start: u64,
     bytes: Vec<u8>,
@@ -115,27 +111,7 @@ pub async fn extract_vp9_webm_frame_png(
     media_url: &str,
     target_us: u64,
 ) -> Result<Vec<u8>, String> {
-    match extract_vp9_webm_frame_png_ranged(client, user_agent, media_url, target_us).await {
-        Ok(png) => Ok(png),
-        Err(range_error) => match extract_vp9_webm_frame_png_full(
-            client, user_agent, media_url, target_us,
-        )
-        .await
-        {
-            Ok(png) => Ok(png),
-            Err(full_error) => Err(format!(
-                "range-seek VP9 extraction failed: {range_error}; full VP9 extraction failed: {full_error}"
-            )),
-        },
-    }
-}
-
-async fn extract_vp9_webm_frame_png_ranged(
-    client: &reqwest::Client,
-    user_agent: &str,
-    media_url: &str,
-    target_us: u64,
-) -> Result<Vec<u8>, String> {
+    debug!(target_us, %media_url, "native vp9 webm frame extraction started");
     let head = fetch_range(
         client,
         user_agent,
@@ -147,8 +123,22 @@ async fn extract_vp9_webm_frame_png_ranged(
     if head.start != 0 {
         return Err(format!("initial range started at byte {}", head.start));
     }
+    debug!(
+        bytes = head.bytes.len(),
+        total_len = head.total_len,
+        "initial webm index range fetched"
+    );
 
     let mut index = parse_webm_index(&head.bytes)?;
+    debug!(
+        video_track = index.video_track.number,
+        codec = %index.video_track.codec_id,
+        timecode_scale_ns = index.timecode_scale_ns,
+        segment_data_start = index.segment_data_start,
+        cues_in_initial_range = index.cues.len(),
+        cues_seek_position = index.cues_seek_position,
+        "webm index parsed"
+    );
     if index.video_track.number == 0 {
         return Err("WebM index has no video track".to_string());
     }
@@ -165,8 +155,9 @@ async fn extract_vp9_webm_frame_png_ranged(
             let cues_end = cues_start
                 .saturating_add(MAX_CUES_RANGE_BYTES)
                 .saturating_sub(1);
-            let cues_range = fetch_range(client, user_agent, media_url, cues_start, Some(cues_end))
-                .await?;
+            debug!(cues_start, cues_end, "fetching webm cues range");
+            let cues_range =
+                fetch_range(client, user_agent, media_url, cues_start, Some(cues_end)).await?;
             if cues_range.start != cues_start {
                 return Err(format!(
                     "cues range started at byte {}, expected {cues_start}",
@@ -179,13 +170,20 @@ async fn extract_vp9_webm_frame_png_ranged(
                 index.timecode_scale_ns,
                 index.segment_data_start,
             );
+            debug!(
+                bytes = cues_range.bytes.len(),
+                cues = index.cues.len(),
+                "webm cues range parsed"
+            );
         }
     }
 
     if index.cues.is_empty() {
         return Err("WebM cues are not available for range seeking".to_string());
     }
-    index.cues.sort_by_key(|cue| (cue.time_us, cue.absolute_cluster_offset));
+    index
+        .cues
+        .sort_by_key(|cue| (cue.time_us, cue.absolute_cluster_offset));
 
     let cue_index = select_cue_index(&index.cues, target_us);
     let cue = &index.cues[cue_index];
@@ -199,6 +197,15 @@ async fn extract_vp9_webm_frame_png_ranged(
         .unwrap_or_else(|| cluster_start.saturating_add(MAX_CLUSTER_RANGE_BYTES))
         .min(cluster_start.saturating_add(MAX_CLUSTER_RANGE_BYTES));
     let cluster_end = cluster_end_exclusive.saturating_sub(1).max(cluster_start);
+    debug!(
+        cue_index,
+        cue_time_us = cue.time_us,
+        cue_cluster_position = cue.cluster_position,
+        cluster_start,
+        cluster_end,
+        next_cluster_start,
+        "selected webm cue and cluster range"
+    );
     let cluster_range = fetch_range(
         client,
         user_agent,
@@ -209,14 +216,10 @@ async fn extract_vp9_webm_frame_png_ranged(
     .await?;
 
     if cluster_range.start != cluster_start {
-        let parsed = parse_webm(&cluster_range.bytes)?;
-        if !parsed.video_track.codec_id.eq_ignore_ascii_case("V_VP9") {
-            return Err(format!(
-                "native extractor only supports V_VP9, got {}",
-                parsed.video_track.codec_id
-            ));
-        }
-        return decode_target_frame_to_png(&parsed.frames, target_us);
+        return Err(format!(
+            "cluster range started at byte {}, expected {cluster_start}",
+            cluster_range.start
+        ));
     }
 
     let frames = parse_cluster_frames_from_range(
@@ -224,57 +227,24 @@ async fn extract_vp9_webm_frame_png_ranged(
         index.video_track.number,
         index.timecode_scale_ns,
     );
+    let keyframes = frames.iter().filter(|frame| frame.keyframe).count();
+    debug!(
+        bytes = cluster_range.bytes.len(),
+        frames = frames.len(),
+        keyframes,
+        first_frame_us = frames.first().map(|frame| frame.time_us),
+        last_frame_us = frames.last().map(|frame| frame.time_us),
+        "webm cluster parsed"
+    );
     if frames.is_empty() {
         return Err(format!(
             "selected cue at {} us / segment cluster position {} had no decodable video frames",
             cue.time_us, cue.cluster_position
         ));
     }
-    decode_target_frame_to_png(&frames, target_us)
-}
-
-async fn extract_vp9_webm_frame_png_full(
-    client: &reqwest::Client,
-    user_agent: &str,
-    media_url: &str,
-    target_us: u64,
-) -> Result<Vec<u8>, String> {
-    let response = client
-        .get(media_url)
-        .header(USER_AGENT, user_agent)
-        .send()
+    tokio::task::spawn_blocking(move || decode_target_frame_to_png(&frames, target_us))
         .await
-        .map_err(|error| format!("native frame fetch failed: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("native frame fetch HTTP {status}"));
-    }
-    if let Some(length) = response.content_length() {
-        if length > MAX_NATIVE_FRAME_BYTES {
-            return Err(format!(
-                "native frame input is too large ({length} bytes > {MAX_NATIVE_FRAME_BYTES})"
-            ));
-        }
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("native frame body read failed: {error}"))?;
-    if bytes.len() as u64 > MAX_NATIVE_FRAME_BYTES {
-        return Err(format!(
-            "native frame input is too large ({} bytes > {MAX_NATIVE_FRAME_BYTES})",
-            bytes.len()
-        ));
-    }
-
-    let parsed = parse_webm(&bytes)?;
-    if !parsed.video_track.codec_id.eq_ignore_ascii_case("V_VP9") {
-        return Err(format!(
-            "native extractor only supports V_VP9, got {}",
-            parsed.video_track.codec_id
-        ));
-    }
-    decode_target_frame_to_png(&parsed.frames, target_us)
+        .map_err(|error| format!("native frame decode task failed: {error}"))?
 }
 
 async fn fetch_range(
@@ -288,23 +258,26 @@ async fn fetch_range(
         Some(end) => format!("bytes={start}-{end}"),
         None => format!("bytes={start}-"),
     };
+    trace!(%range, %media_url, "native frame range fetch request");
     let response = client
         .get(media_url)
         .header(USER_AGENT, user_agent)
-        .header(RANGE, range)
+        .header(RANGE, range.as_str())
         .send()
         .await
         .map_err(|error| format!("native range fetch failed: {error}"))?;
     let status = response.status();
-    if !status.is_success() {
-        return Err(format!("native range fetch HTTP {status}"));
+    trace!(%range, %status, "native frame range fetch response headers received");
+    if status.as_u16() != 206 {
+        return Err(format!(
+            "native range fetch expected HTTP 206, got {status}"
+        ));
     }
     let content_range = response
         .headers()
         .get(CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let content_length = response.content_length();
     let bytes = response
         .bytes()
         .await
@@ -315,28 +288,22 @@ async fn fetch_range(
             bytes.len()
         ));
     }
+    trace!(
+        %range,
+        bytes = bytes.len(),
+        content_range = content_range.as_deref().unwrap_or(""),
+        "native frame range body read"
+    );
 
     let parsed_range = content_range
         .as_deref()
-        .and_then(parse_content_range_header);
-    let actual_start = parsed_range
-        .as_ref()
-        .map(|range| range.0)
-        .unwrap_or_else(|| if status.as_u16() == 206 { start } else { 0 });
-    let total_len = parsed_range
-        .and_then(|range| range.2)
-        .or_else(|| {
-            if status.as_u16() == 200 {
-                content_length
-            } else {
-                None
-            }
-        });
+        .and_then(parse_content_range_header)
+        .ok_or_else(|| "native range fetch returned an invalid Content-Range".to_string())?;
 
     Ok(RangeFetch {
-        start: actual_start,
+        start: parsed_range.0,
         bytes: bytes.to_vec(),
-        total_len,
+        total_len: parsed_range.2,
     })
 }
 
@@ -368,7 +335,8 @@ fn parse_webm_index(data: &[u8]) -> Result<WebmIndex, String> {
         for child in iter_elements(data, element.data_start, element.data_end) {
             match child.id {
                 INFO_ID => {
-                    if let Some(value) = parse_timecode_scale(data, child.data_start, child.data_end)
+                    if let Some(value) =
+                        parse_timecode_scale(data, child.data_start, child.data_end)
                     {
                         index.timecode_scale_ns = value;
                     }
@@ -403,60 +371,6 @@ fn parse_webm_index(data: &[u8]) -> Result<WebmIndex, String> {
     Ok(index)
 }
 
-fn parse_webm(data: &[u8]) -> Result<ParsedWebm, String> {
-    if !iter_elements(data, 0, data.len()).any(|element| element.id == EBML_ID) {
-        return Err("input is not an EBML/WebM file".to_string());
-    }
-
-    let mut timecode_scale_ns = DEFAULT_TIMECODE_SCALE_NS;
-    let mut video_track = VideoTrack::default();
-    let mut frames = Vec::new();
-
-    for element in iter_elements(data, 0, data.len()) {
-        if element.id != SEGMENT_ID {
-            continue;
-        }
-        for child in iter_elements(data, element.data_start, element.data_end) {
-            match child.id {
-                INFO_ID => {
-                    if let Some(value) = parse_timecode_scale(data, child.data_start, child.data_end) {
-                        timecode_scale_ns = value;
-                    }
-                }
-                TRACKS_ID => {
-                    if let Some(track) = parse_video_track(data, child.data_start, child.data_end) {
-                        video_track = track;
-                    }
-                }
-                CLUSTER_ID => {
-                    if video_track.number != 0 {
-                        parse_cluster(
-                            data,
-                            child.data_start,
-                            child.data_end,
-                            video_track.number,
-                            timecode_scale_ns,
-                            &mut frames,
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if video_track.number == 0 {
-        return Err("WebM has no video track".to_string());
-    }
-    if frames.is_empty() {
-        return Err("WebM has no usable VP9 video frames".to_string());
-    }
-    Ok(ParsedWebm {
-        video_track,
-        frames,
-    })
-}
-
 fn parse_timecode_scale(data: &[u8], start: usize, end: usize) -> Option<u64> {
     iter_elements(data, start, end)
         .find(|element| element.id == TIMECODE_SCALE_ID)
@@ -468,8 +382,6 @@ fn parse_video_track(data: &[u8], start: usize, end: usize) -> Option<VideoTrack
         let mut number = 0;
         let mut track_type = 0;
         let mut codec_id = String::new();
-        let mut width = 0;
-        let mut height = 0;
         for child in iter_elements(data, entry.data_start, entry.data_end) {
             match child.id {
                 TRACK_NUMBER_ID => number = read_uint(&data[child.data_start..child.data_end]),
@@ -478,30 +390,11 @@ fn parse_video_track(data: &[u8], start: usize, end: usize) -> Option<VideoTrack
                     codec_id =
                         String::from_utf8_lossy(&data[child.data_start..child.data_end]).to_string()
                 }
-                VIDEO_ID => {
-                    for video_child in iter_elements(data, child.data_start, child.data_end) {
-                        match video_child.id {
-                            PIXEL_WIDTH_ID => {
-                                width = read_uint(&data[video_child.data_start..video_child.data_end])
-                            }
-                            PIXEL_HEIGHT_ID => {
-                                height =
-                                    read_uint(&data[video_child.data_start..video_child.data_end])
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 _ => {}
             }
         }
         if number != 0 && track_type == TRACK_TYPE_VIDEO {
-            return Some(VideoTrack {
-                number,
-                codec_id,
-                width,
-                height,
-            });
+            return Some(VideoTrack { number, codec_id });
         }
     }
     None
@@ -765,12 +658,39 @@ fn decode_target_frame_to_png(frames: &[Vp9Frame], target_us: u64) -> Result<Vec
         .last()
         .or_else(|| frames.iter().position(|frame| frame.keyframe))
         .unwrap_or(0);
+    debug!(
+        target_us,
+        frames = frames.len(),
+        start_index,
+        start_frame_us = frames.get(start_index).map(|frame| frame.time_us),
+        "starting vp9 decode from selected keyframe"
+    );
 
     let mut decoder = Vp9Decoder::new()?;
     let mut best: Option<(u64, Vec<u8>, u32, u32)> = None;
-    for frame in &frames[start_index..] {
-        for decoded in decoder.decode(&frame.data)? {
+    for (relative_index, frame) in frames[start_index..].iter().enumerate() {
+        let absolute_index = start_index + relative_index;
+        let next_time_us = frames.get(absolute_index + 1).map(|next| next.time_us);
+        let should_capture_rgba = frame.time_us >= target_us
+            || next_time_us
+                .map(|next| next >= target_us)
+                .unwrap_or(true);
+        trace!(
+            frame_time_us = frame.time_us,
+            keyframe = frame.keyframe,
+            bytes = frame.data.len(),
+            capture_rgba = should_capture_rgba,
+            "decoding vp9 packet"
+        );
+        for decoded in decoder.decode(&frame.data, should_capture_rgba)? {
             let distance = frame.time_us.abs_diff(target_us);
+            trace!(
+                frame_time_us = frame.time_us,
+                distance_us = distance,
+                width = decoded.width,
+                height = decoded.height,
+                "vp9 packet produced decoded frame"
+            );
             let replace = best
                 .as_ref()
                 .map(|(best_distance, _, _, _)| distance < *best_distance)
@@ -791,6 +711,7 @@ fn decode_target_frame_to_png(frames: &[Vp9Frame], target_us: u64) -> Result<Vec
     PngEncoder::new_with_quality(&mut png, CompressionType::Fast, FilterType::Adaptive)
         .write_image(&rgba, width, height, ExtendedColorType::Rgba8)
         .map_err(|error| format!("PNG encode failed: {error}"))?;
+    debug!(width, height, bytes = png.len(), "vp9 frame encoded as png");
     Ok(png)
 }
 
@@ -827,7 +748,7 @@ impl Vp9Decoder {
         }
     }
 
-    fn decode(&mut self, packet: &[u8]) -> Result<Vec<DecodedFrame>, String> {
+    fn decode(&mut self, packet: &[u8], capture_rgba: bool) -> Result<Vec<DecodedFrame>, String> {
         unsafe {
             let err = vpx::vpx_codec_decode(
                 &mut self.ctx,
@@ -846,7 +767,9 @@ impl Vp9Decoder {
                 if image.is_null() {
                     break;
                 }
-                out.push(image_to_rgba(&*image)?);
+                if capture_rgba {
+                    out.push(image_to_rgba(&*image)?);
+                }
             }
             Ok(out)
         }

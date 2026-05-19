@@ -4,25 +4,23 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
-use http::{Method, Request, Response, StatusCode};
 use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{lookup_host, TcpListener};
-use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use web_service::{
     load_default_tls_base64, load_tls_base64_from_paths, BodyStream, H2H3Server, HandlerResponse,
     HandlerResult, Router, Server, ServerBuilder, ServerError, StreamWriter, WebSocketHandler,
@@ -38,7 +36,6 @@ const ANDROID_VR_USER_AGENT: &str =
     "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const IOS_USER_AGENT: &str =
     "com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)";
-const DEFAULT_FRAME_TIMEOUT_SECONDS: u64 = 75;
 
 #[derive(Clone)]
 struct AppConfig {
@@ -251,6 +248,7 @@ impl MediaProxy {
     }
 
     async fn frame_image(&self, req: Request<()>) -> HandlerResponse {
+        let started_at = Instant::now();
         if req.method() == Method::OPTIONS {
             return self.options();
         }
@@ -270,6 +268,7 @@ impl MediaProxy {
             Ok(value) => value,
             Err(error) => return self.text_response(StatusCode::BAD_REQUEST, &error),
         };
+        debug!(%source, ts_us, "frame request received");
         let source_url = match Url::parse(&source) {
             Ok(url) => url,
             Err(error) => {
@@ -287,19 +286,28 @@ impl MediaProxy {
                     "Could not extract YouTube video id.",
                 );
             };
+            debug!(%video_id, ts_us, "resolving youtube source for frame extraction");
             match self.fetch_best_innertube_player_response(&video_id).await {
-                Ok((_resolver, player_response, _attempts)) => {
+                Ok((resolver, player_response, attempts)) => {
+                    debug!(
+                        %video_id,
+                        %resolver,
+                        attempts = attempts.len(),
+                        "youtube source resolved for frame extraction"
+                    );
                     match select_best_frame_media_url(&player_response) {
-                        Some(url) => url,
-                        None => {
-                            return self.text_response(
-                                StatusCode::BAD_GATEWAY,
-                                "No direct YouTube video stream was available for frame extraction.",
-                            )
+                        Some(url) => {
+                            debug!(%url, "selected native frame media url");
+                            url
                         }
+                        None => return self.text_response(
+                            StatusCode::BAD_GATEWAY,
+                            "No direct YouTube video stream was available for frame extraction.",
+                        ),
                     }
                 }
                 Err(error) => {
+                    warn!(%video_id, %error, "youtube resolve failed for frame extraction");
                     return self.text_response(
                         StatusCode::BAD_GATEWAY,
                         &format!("YouTube resolve failed: {error}"),
@@ -318,17 +326,32 @@ impl MediaProxy {
         }
 
         match self.extract_frame_image(media_url.as_str(), ts_us).await {
-            Ok(image) => HandlerResponse {
-                status: StatusCode::OK,
-                body: Some(Bytes::from(image.bytes)),
-                content_type: Some(image.content_type.to_string()),
-                headers: base_response_headers(),
-                etag: None,
-            },
-            Err(error) => self.text_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("Frame extraction failed: {error}"),
-            ),
+            Ok(image) => {
+                debug!(
+                    bytes = image.bytes.len(),
+                    content_type = image.content_type,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "frame extraction completed"
+                );
+                HandlerResponse {
+                    status: StatusCode::OK,
+                    body: Some(Bytes::from(image.bytes)),
+                    content_type: Some(image.content_type.to_string()),
+                    headers: base_response_headers(),
+                    etag: None,
+                }
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "frame extraction failed"
+                );
+                self.text_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Frame extraction failed: {error}"),
+                )
+            }
         }
     }
 
@@ -337,91 +360,19 @@ impl MediaProxy {
         media_url: &str,
         ts_us: u64,
     ) -> Result<ExtractedFrameImage, String> {
-        if env_bool("AV_INGEST_NATIVE_FRAME", true) {
-            match native_frame::extract_vp9_webm_frame_png(
-                &self.client,
-                &self.user_agent,
-                media_url,
-                ts_us,
-            )
-            .await
-            {
-                Ok(bytes) => {
-                    return Ok(ExtractedFrameImage {
-                        bytes,
-                        content_type: "image/png",
-                    });
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "native VP9 frame extraction failed; falling back to ffmpeg"
-                    );
-                }
-            }
-        }
-
-        let bytes = self.extract_frame_jpeg(media_url, ts_us).await?;
+        debug!(%media_url, ts_us, "starting native frame extraction");
+        let bytes = native_frame::extract_vp9_webm_frame_png(
+            &self.client,
+            &self.user_agent,
+            media_url,
+            ts_us,
+        )
+        .await?;
+        debug!(bytes = bytes.len(), "native frame extraction produced png");
         Ok(ExtractedFrameImage {
             bytes,
-            content_type: "image/jpeg",
+            content_type: "image/png",
         })
-    }
-
-    async fn extract_frame_jpeg(&self, media_url: &str, ts_us: u64) -> Result<Vec<u8>, String> {
-        let ffmpeg = env::var("AV_INGEST_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
-        let timeout_seconds = env_u64("AV_INGEST_FRAME_TIMEOUT_SECONDS", DEFAULT_FRAME_TIMEOUT_SECONDS)
-            .map_err(|error| error.to_string())?;
-        let timestamp = format!("{:.6}", ts_us as f64 / 1_000_000.0);
-        let mut command = Command::new(ffmpeg);
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::null())
-            .stderr(Stdio::piped())
-            .stdout(Stdio::piped())
-            .arg("-nostdin")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-user_agent")
-            .arg(&self.user_agent)
-            .arg("-i")
-            .arg(media_url)
-            .arg("-ss")
-            .arg(timestamp)
-            .arg("-map")
-            .arg("0:v:0")
-            .arg("-frames:v")
-            .arg("1")
-            .arg("-an")
-            .arg("-f")
-            .arg("image2pipe")
-            .arg("-vcodec")
-            .arg("mjpeg")
-            .arg("-q:v")
-            .arg("2")
-            .arg("pipe:1");
-
-        let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
-            .await
-            .map_err(|_| format!("ffmpeg timed out after {timeout_seconds}s"))?
-            .map_err(|error| format!("failed to run ffmpeg: {error}"))?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "ffmpeg exited with status {}{}",
-                output.status,
-                if detail.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(": {}", detail.trim())
-                }
-            ));
-        }
-        if output.stdout.is_empty() {
-            return Err("ffmpeg returned an empty frame".to_string());
-        }
-        Ok(output.stdout)
     }
 
     async fn proxy_media(
@@ -478,7 +429,9 @@ impl MediaProxy {
         };
 
         if req.method() == Method::GET && is_hls_response(&response) {
-            return self.write_hls_playlist(writer, response, origin.as_deref()).await;
+            return self
+                .write_hls_playlist(writer, response, origin.as_deref())
+                .await;
         }
 
         let head = streaming_head(&response, origin.as_deref())?;
@@ -742,10 +695,7 @@ impl MediaProxy {
             .header("x-handled-by", "av-ingest-proxy")
             .header("access-control-allow-origin", cors_allow_origin(origin))
             .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
-            .header(
-                "access-control-allow-headers",
-                CORS_ALLOW_HEADERS,
-            )
+            .header("access-control-allow-headers", CORS_ALLOW_HEADERS)
             .header("access-control-allow-private-network", "true")
             .header("cross-origin-resource-policy", "cross-origin")
             .header("timing-allow-origin", "*")
@@ -772,10 +722,7 @@ impl MediaProxy {
             .header("x-handled-by", "av-ingest-proxy")
             .header("access-control-allow-origin", cors_allow_origin(origin))
             .header("access-control-allow-methods", "GET, HEAD, OPTIONS")
-            .header(
-                "access-control-allow-headers",
-                CORS_ALLOW_HEADERS,
-            )
+            .header("access-control-allow-headers", CORS_ALLOW_HEADERS)
             .header("access-control-allow-private-network", "true")
             .header("cross-origin-resource-policy", "cross-origin")
             .header("timing-allow-origin", "*")
@@ -997,7 +944,10 @@ fn cors_allow_origin(origin: Option<&str>) -> &str {
     origin.unwrap_or("*")
 }
 
-fn streaming_head(response: &reqwest::Response, origin: Option<&str>) -> HandlerResult<Response<()>> {
+fn streaming_head(
+    response: &reqwest::Response,
+    origin: Option<&str>,
+) -> HandlerResult<Response<()>> {
     let mut builder = Response::builder().status(status_from_reqwest(response.status())?);
     for (name, value) in response.headers() {
         if should_forward_response_header(name.as_str()) {
@@ -1232,8 +1182,7 @@ fn iter_player_formats(player_response: &Value) -> impl Iterator<Item = &Value> 
 fn select_best_frame_media_url(player_response: &Value) -> Option<Url> {
     iter_player_formats(player_response)
         .filter_map(|format| {
-            let mime = format.get("mimeType").and_then(Value::as_str).unwrap_or_default();
-            if !mime.starts_with("video/") {
+            if !is_native_frame_format(format) {
                 return None;
             }
             let url = format.get("url").and_then(Value::as_str)?;
@@ -1242,6 +1191,17 @@ fn select_best_frame_media_url(player_response: &Value) -> Option<Url> {
         })
         .max_by_key(|(score, _url)| *score)
         .map(|(_score, url)| url)
+}
+
+fn is_native_frame_format(format: &Value) -> bool {
+    let mime = format
+        .get("mimeType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    mime.starts_with("video/")
+        && mime.contains("webm")
+        && (mime.contains("vp9") || mime.contains("vp09"))
 }
 
 fn frame_format_score(format: &Value) -> i64 {
@@ -1261,34 +1221,10 @@ fn frame_format_score(format: &Value) -> i64 {
         .and_then(Value::as_i64)
         .unwrap_or(0)
         .max(0);
-    let mime = format
-        .get("mimeType")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let codec_score = if mime.contains("vp9") || mime.contains("vp09") {
-        900_000
-    } else if mime.contains("av01") {
-        100_000
-    } else if mime.contains("avc1") || mime.contains("h264") {
-        50_000
-    } else {
-        0
-    };
-    let container_score = if mime.contains("webm") {
-        50_000
-    } else if mime.contains("mp4") {
-        10_000
-    } else {
-        0
-    };
 
     width
         .saturating_mul(height)
         .saturating_add((bitrate / 1000).min(100_000))
-        .saturating_add(codec_score)
-        .saturating_add(container_score)
 }
 
 fn format_needs_challenge(format: &Value) -> bool {
@@ -1496,15 +1432,6 @@ fn env_u16(name: &str, default: u16) -> Result<u16> {
     }
 }
 
-fn env_u64(name: &str, default: u64) -> Result<u64> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .with_context(|| format!("failed to parse {name}={value} as u64")),
-        Err(_) => Ok(default),
-    }
-}
-
 fn frame_timestamp_us(query: &str) -> Result<u64, String> {
     for name in ["ts_us", "time_us", "timestamp_us"] {
         if let Some(value) = query_param(query, name) {
@@ -1578,7 +1505,12 @@ async fn run_plain_http_server(port: u16, router: Arc<dyn Router>) -> Result<()>
         .with_context(|| format!("failed to bind local HTTP av-ingest proxy at {addr}"))?;
 
     info!("HTTP/1.1 local dev server listening at {}", addr);
-    info!(port = port, h3 = false, tls = false, "av ingest proxy ready");
+    info!(
+        port = port,
+        h3 = false,
+        tls = false,
+        "av ingest proxy ready"
+    );
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);

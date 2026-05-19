@@ -13,8 +13,7 @@ stream; `/frame` can use the highest-resolution source stream.
 brew install libvpx pkg-config
 ```
 
-You also need Rust/Cargo. `ffmpeg` is optional and is only used as a fallback for
-`/frame`.
+You also need Rust/Cargo.
 
 ## Run locally
 
@@ -51,8 +50,8 @@ GET      /frame?url=...&ts_us=...
 for playback and seeking.
 
 `/frame` extracts a still image from the source stream at a microsecond
-timestamp. It can select a high-resolution WebM/VP9 stream, seek by WebM cues,
-decode with `libvpx`, and return PNG.
+timestamp. It selects a high-resolution WebM/VP9 stream, seeks by WebM cues,
+decodes with `libvpx`, and returns PNG.
 
 ## Smoke tests
 
@@ -92,24 +91,11 @@ curl -fsS \
 Native path:
 
 1. Resolve source streams.
-2. Pick the best video stream, preferring high-resolution WebM/VP9 when present.
+2. Pick the best WebM/VP9 video stream.
 3. Fetch enough bytes to parse WebM metadata and cues.
 4. Range-fetch the cluster around `ts_us`.
 5. Decode VP9 with `libvpx`.
 6. Return PNG.
-
-Fallbacks:
-
-- If cue seeking fails, fetch the full WebM and decode natively.
-- If native decode fails, use `ffmpeg` if available.
-
-Environment flags:
-
-```text
-AV_INGEST_NATIVE_FRAME=0
-AV_INGEST_FFMPEG=/path/to/ffmpeg
-AV_INGEST_FRAME_TIMEOUT_SECONDS=75
-```
 
 ## Notes
 
