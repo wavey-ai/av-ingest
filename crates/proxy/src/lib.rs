@@ -13,13 +13,15 @@ use hyper_util::rt::TokioIo;
 use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{lookup_host, TcpListener};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
@@ -33,12 +35,15 @@ use web_service::{
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 const YOUTUBE_WEB_API_KEY: &str = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const WEB_SAFARI_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)";
+const MWEB_USER_AGENT: &str = "Mozilla/5.0 (iPad; CPU OS 16_7_10 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1,gzip(gfe)";
+const TV_USER_AGENT: &str = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)";
 const ANDROID_USER_AGENT: &str =
     "com.google.android.youtube/21.03.36(Linux; U; Android 16; en_US; SM-S908E Build/TP1A.220624.014) gzip";
 const ANDROID_VR_USER_AGENT: &str =
     "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const IOS_USER_AGENT: &str =
-    "com.google.ios.youtube/20.11.6 (iPhone10,4; U; CPU iOS 16_7_7 like Mac OS X)";
+    "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
 
 #[derive(Clone)]
 struct AppConfig {
@@ -48,6 +53,7 @@ struct AppConfig {
     cert_path: Option<String>,
     key_path: Option<String>,
     user_agent: String,
+    youtube: YoutubeConfig,
     ytdlp: YtDlpConfig,
     resolve_mode: ResolveMode,
 }
@@ -60,6 +66,31 @@ struct YtDlpConfig {
     cookies: Option<String>,
     cookies_from_browser: Option<String>,
     timeout: Duration,
+}
+
+#[derive(Clone, Debug, Default)]
+struct YoutubeConfig {
+    cookies_path: Option<String>,
+    cookies: YoutubeCookieJar,
+    visitor_data: Option<String>,
+    player_po_token: Option<String>,
+    gvs_po_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct YoutubeCookieJar {
+    cookies: Vec<YoutubeCookie>,
+}
+
+#[derive(Clone, Debug)]
+struct YoutubeCookie {
+    domain: String,
+    include_subdomains: bool,
+    path: String,
+    secure: bool,
+    expires: Option<u64>,
+    name: String,
+    value: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +133,16 @@ impl ResolveMode {
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
+        let ytdlp = YtDlpConfig {
+            enabled: env_bool("AV_INGEST_PROXY_YTDLP_ENABLED", true),
+            path: env::var("AV_INGEST_PROXY_YTDLP_PATH").unwrap_or_else(|_| "yt-dlp".to_string()),
+            extractor_args: env_nonempty("AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS"),
+            cookies: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES"),
+            cookies_from_browser: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER"),
+            timeout: Duration::from_secs(env_u64("AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS", 45)?),
+        };
+        let youtube = YoutubeConfig::from_env(&ytdlp)?;
+
         Ok(Self {
             port: env_u16("AV_INGEST_PROXY_PORT", 8444)?,
             enable_h3: env_bool("AV_INGEST_PROXY_ENABLE_H3", false),
@@ -110,15 +151,8 @@ impl AppConfig {
             key_path: env::var("AV_INGEST_PROXY_TLS_KEY_PATH").ok(),
             user_agent: env::var("AV_INGEST_PROXY_USER_AGENT")
                 .unwrap_or_else(|_| DEFAULT_USER_AGENT.to_string()),
-            ytdlp: YtDlpConfig {
-                enabled: env_bool("AV_INGEST_PROXY_YTDLP_ENABLED", true),
-                path: env::var("AV_INGEST_PROXY_YTDLP_PATH")
-                    .unwrap_or_else(|_| "yt-dlp".to_string()),
-                extractor_args: env_nonempty("AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS"),
-                cookies: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES"),
-                cookies_from_browser: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER"),
-                timeout: Duration::from_secs(env_u64("AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS", 45)?),
-            },
+            youtube,
+            ytdlp,
             resolve_mode: ResolveMode::from_env()?,
         })
     }
@@ -141,10 +175,187 @@ impl AppConfig {
     }
 }
 
+impl YoutubeConfig {
+    fn from_env(ytdlp: &YtDlpConfig) -> Result<Self> {
+        let cookies_path =
+            env_nonempty("AV_INGEST_PROXY_YOUTUBE_COOKIES").or_else(|| ytdlp.cookies.clone());
+        let cookies = match &cookies_path {
+            Some(path) => YoutubeCookieJar::from_netscape_file(path)
+                .with_context(|| format!("failed to load YouTube cookies from {path}"))?,
+            None => YoutubeCookieJar::default(),
+        };
+
+        Ok(Self {
+            cookies_path,
+            cookies,
+            visitor_data: env_nonempty("AV_INGEST_PROXY_YOUTUBE_VISITOR_DATA"),
+            player_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN"),
+            gvs_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN"),
+        })
+    }
+
+    fn auth_state_json(&self) -> Value {
+        json!({
+            "cookiesConfigured": self.cookies_path.is_some(),
+            "authCookiesPresent": self.cookies.has_auth_cookies(),
+            "visitorDataConfigured": self.visitor_data.is_some(),
+            "playerPoTokenConfigured": self.player_po_token.is_some(),
+            "gvsPoTokenConfigured": self.gvs_po_token.is_some(),
+        })
+    }
+
+    fn cookie_header_for_url(&self, url: &Url) -> Option<String> {
+        self.cookies.header_for_url(url)
+    }
+
+    fn sid_authorization_header(&self, origin: &str) -> Option<String> {
+        self.sid_authorization_header_at(origin, unix_timestamp_seconds())
+    }
+
+    fn sid_authorization_header_at(&self, origin: &str, timestamp: u64) -> Option<String> {
+        self.cookies.sid_authorization_header(origin, timestamp)
+    }
+
+    fn apply_gvs_po_token_to_player_response(&self, player_response: &mut Value) {
+        let Some(po_token) = self.gvs_po_token.as_deref() else {
+            return;
+        };
+        append_gvs_po_token_to_player_response(player_response, po_token);
+    }
+
+    fn apply_gvs_po_token_to_url_if_missing(&self, url: &mut Url) {
+        let Some(po_token) = self.gvs_po_token.as_deref() else {
+            return;
+        };
+        append_gvs_po_token_to_url(url, po_token);
+    }
+}
+
+impl YoutubeCookieJar {
+    fn from_netscape_file(path: &str) -> Result<Self> {
+        let contents = fs::read_to_string(path)?;
+        Self::parse_netscape(&contents)
+    }
+
+    fn parse_netscape(contents: &str) -> Result<Self> {
+        let mut cookies = Vec::new();
+        for (index, raw_line) in contents.lines().enumerate() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with("# Netscape") {
+                continue;
+            }
+
+            let http_only_stripped = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+            if http_only_stripped.starts_with('#') {
+                continue;
+            }
+
+            let fields = http_only_stripped.splitn(7, '\t').collect::<Vec<_>>();
+            if fields.len() != 7 {
+                anyhow::bail!("invalid Netscape cookie line {}", index + 1);
+            }
+
+            let expires = match fields[4].parse::<u64>() {
+                Ok(0) => None,
+                Ok(value) => Some(value),
+                Err(_) => anyhow::bail!("invalid cookie expiry on line {}", index + 1),
+            };
+            let name = fields[5].to_string();
+            if name.is_empty() {
+                anyhow::bail!("empty cookie name on line {}", index + 1);
+            }
+
+            cookies.push(YoutubeCookie {
+                domain: fields[0].trim_start_matches('.').to_ascii_lowercase(),
+                include_subdomains: fields[1].eq_ignore_ascii_case("TRUE")
+                    || fields[0].starts_with('.'),
+                path: fields[2].to_string(),
+                secure: fields[3].eq_ignore_ascii_case("TRUE"),
+                expires,
+                name,
+                value: fields[6].to_string(),
+            });
+        }
+
+        Ok(Self { cookies })
+    }
+
+    fn header_for_url(&self, url: &Url) -> Option<String> {
+        let now = unix_timestamp_seconds();
+        let host = url.host_str()?.to_ascii_lowercase();
+        let path = url.path();
+        let secure = url.scheme() == "https";
+        let cookies = self
+            .cookies
+            .iter()
+            .filter(|cookie| cookie.matches(&host, path, secure, now))
+            .map(|cookie| format!("{}={}", cookie.name, cookie.value))
+            .collect::<Vec<_>>();
+
+        (!cookies.is_empty()).then(|| cookies.join("; "))
+    }
+
+    fn cookie_value_for_youtube(&self, name: &str) -> Option<&str> {
+        let url = Url::parse("https://www.youtube.com/").ok()?;
+        let now = unix_timestamp_seconds();
+        let host = url.host_str()?.to_ascii_lowercase();
+        self.cookies
+            .iter()
+            .rev()
+            .find(|cookie| cookie.name == name && cookie.matches(&host, url.path(), true, now))
+            .map(|cookie| cookie.value.as_str())
+    }
+
+    fn has_auth_cookies(&self) -> bool {
+        self.cookie_value_for_youtube("LOGIN_INFO").is_some()
+            && (self.cookie_value_for_youtube("SAPISID").is_some()
+                || self.cookie_value_for_youtube("__Secure-1PAPISID").is_some()
+                || self.cookie_value_for_youtube("__Secure-3PAPISID").is_some())
+    }
+
+    fn sid_authorization_header(&self, origin: &str, timestamp: u64) -> Option<String> {
+        let sapisid = self
+            .cookie_value_for_youtube("SAPISID")
+            .or_else(|| self.cookie_value_for_youtube("__Secure-3PAPISID"));
+        let one_party = self.cookie_value_for_youtube("__Secure-1PAPISID");
+        let three_party = self.cookie_value_for_youtube("__Secure-3PAPISID");
+        let authorizations = [
+            ("SAPISIDHASH", sapisid),
+            ("SAPISID1PHASH", one_party),
+            ("SAPISID3PHASH", three_party),
+        ]
+        .into_iter()
+        .filter_map(|(scheme, sid)| {
+            sid.map(|sid| sid_authorization_part(scheme, sid, origin, timestamp))
+        })
+        .collect::<Vec<_>>();
+
+        (!authorizations.is_empty()).then(|| authorizations.join(" "))
+    }
+}
+
+impl YoutubeCookie {
+    fn matches(&self, host: &str, path: &str, secure: bool, now: u64) -> bool {
+        if self.secure && !secure {
+            return false;
+        }
+        if self.expires.is_some_and(|expires| expires < now) {
+            return false;
+        }
+        let domain_matches = host == self.domain
+            || (self.include_subdomains
+                && host
+                    .strip_suffix(&self.domain)
+                    .is_some_and(|prefix| prefix.ends_with('.')));
+        domain_matches && path.starts_with(&self.path)
+    }
+}
+
 #[derive(Clone)]
 struct MediaProxy {
     client: reqwest::Client,
     user_agent: String,
+    youtube: YoutubeConfig,
     ytdlp: YtDlpConfig,
     resolve_mode: ResolveMode,
 }
@@ -167,11 +378,24 @@ impl TranscribeAudioResolver {
     pub fn from_env() -> Result<Self> {
         let config = AppConfig::from_env()?;
         Ok(Self {
-            proxy: MediaProxy::new(config.user_agent, config.ytdlp, config.resolve_mode)?,
+            proxy: MediaProxy::new(
+                config.user_agent,
+                config.youtube,
+                config.ytdlp,
+                config.resolve_mode,
+            )?,
         })
     }
 
     pub async fn open_youtube_audio(&self, source: &str) -> Result<TranscribeAudioStream> {
+        self.open_youtube_audio_stream(source).await
+    }
+
+    pub async fn open_youtube_video_audio(&self, source: &str) -> Result<TranscribeAudioStream> {
+        self.open_youtube_audio_stream(source).await
+    }
+
+    async fn open_youtube_audio_stream(&self, source: &str) -> Result<TranscribeAudioStream> {
         let source_url =
             Url::parse(source).with_context(|| format!("invalid YouTube source URL: {source}"))?;
         self.proxy
@@ -211,7 +435,12 @@ struct TranscribeMediaSource {
 }
 
 impl MediaProxy {
-    fn new(user_agent: String, ytdlp: YtDlpConfig, resolve_mode: ResolveMode) -> Result<Self> {
+    fn new(
+        user_agent: String,
+        youtube: YoutubeConfig,
+        ytdlp: YtDlpConfig,
+        resolve_mode: ResolveMode,
+    ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .no_gzip()
@@ -228,6 +457,7 @@ impl MediaProxy {
         Ok(Self {
             client,
             user_agent,
+            youtube,
             ytdlp,
             resolve_mode,
         })
@@ -255,14 +485,48 @@ impl MediaProxy {
         }
     }
 
+    fn apply_youtube_cookie_header(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &Url,
+    ) -> reqwest::RequestBuilder {
+        match self.youtube.cookie_header_for_url(url) {
+            Some(cookie_header) => request.header(reqwest::header::COOKIE, cookie_header),
+            None => request,
+        }
+    }
+
+    fn apply_youtube_api_auth_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &Url,
+        origin: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut request = self.apply_youtube_cookie_header(request, url);
+        if let Some(auth_header) = self.youtube.sid_authorization_header(origin) {
+            request = request
+                .header(reqwest::header::AUTHORIZATION, auth_header)
+                .header("x-origin", origin);
+            if self.youtube.cookies.has_auth_cookies() {
+                request = request.header("x-youtube-bootstrap-logged-in", "true");
+            }
+        }
+        request
+    }
+
     async fn fetch_youtube_visitor_data(&self, video_id: &str) -> Result<String, String> {
-        let response = self
-            .client
-            .get(format!("https://www.youtube.com/watch?v={video_id}"))
-            .header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT)
-            .send()
-            .await
+        if let Some(visitor_data) = &self.youtube.visitor_data {
+            return Ok(visitor_data.clone());
+        }
+
+        let watch_url = Url::parse(&format!("https://www.youtube.com/watch?v={video_id}"))
             .map_err(|error| error.to_string())?;
+        let mut request = self
+            .client
+            .get(watch_url.clone())
+            .header(reqwest::header::USER_AGENT, DEFAULT_USER_AGENT);
+        request = self.apply_youtube_cookie_header(request, &watch_url);
+        let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
         if !status.is_success() {
             return Err(format!("watch page HTTP {status}"));
@@ -315,6 +579,9 @@ impl MediaProxy {
 
         match self.fetch_best_innertube_player_response(&video_id).await {
             Ok((resolver, mut player_response, attempts)) => {
+                self.youtube
+                    .apply_gvs_po_token_to_player_response(&mut player_response);
+                normalize_player_response_for_streaming(&mut player_response);
                 if let Some(object) = player_response.as_object_mut() {
                     object.insert(
                         "__avIngestAttempts".to_string(),
@@ -354,15 +621,40 @@ impl MediaProxy {
                             .pointer("/videoDetails/lengthSeconds")
                             .and_then(Value::as_str)
                             .and_then(|value| value.parse::<u64>().ok()),
+                        "streams": stream_summary_json(&player_response, &resolver),
                         "playerChallenge": Value::Null,
                         "playerResponse": player_response,
                     }),
                 )
             }
-            Err(error) => self.json_response(
-                StatusCode::BAD_GATEWAY,
-                json!({"error": format!("YouTube resolve failed: {error}")}),
-            ),
+            Err(error) => {
+                let status = if error.auth_block.is_some() {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                let mut body = json!({
+                    "error": format!("YouTube resolve failed: {error}"),
+                    "provider": "youtube",
+                    "resolveMode": resolve_mode.as_str(),
+                    "url": source_url.as_str(),
+                    "attempts": error.attempts,
+                    "nativeAuth": self.youtube.auth_state_json(),
+                });
+                if let Some(auth_block) = error.auth_block {
+                    body["playabilityStatus"] =
+                        auth_block.status.map(Value::String).unwrap_or(Value::Null);
+                    body["playabilityReason"] =
+                        auth_block.reason.map(Value::String).unwrap_or(Value::Null);
+                    body["playabilitySubreason"] = auth_block
+                        .subreason
+                        .map(Value::String)
+                        .unwrap_or(Value::Null);
+                    body["authRequired"] = Value::Bool(true);
+                    body["botCheck"] = Value::Bool(auth_block.bot_check);
+                }
+                self.json_response(status, body)
+            }
         }
     }
 
@@ -444,7 +736,10 @@ impl MediaProxy {
                         "yt-dlp frame source failed; falling back to InnerTube"
                     );
                     match self.fetch_best_innertube_player_response(&video_id).await {
-                        Ok((resolver, player_response, attempts)) => {
+                        Ok((resolver, mut player_response, attempts)) => {
+                            self.youtube
+                                .apply_gvs_po_token_to_player_response(&mut player_response);
+                            normalize_player_response_for_streaming(&mut player_response);
                             debug!(
                                 %video_id,
                                 %resolver,
@@ -567,6 +862,9 @@ impl MediaProxy {
             .fetch_best_innertube_player_response(&video_id)
             .await
             .map_err(|error| anyhow::anyhow!("YouTube resolve failed: {error}"))?;
+        self.youtube
+            .apply_gvs_po_token_to_player_response(&mut player_response);
+        normalize_player_response_for_streaming(&mut player_response);
         apply_transcribe_resolve_mode(&mut player_response);
         let media_source = select_transcribe_media_source(&player_response, &resolver)
             .ok_or_else(|| anyhow::anyhow!(ResolveMode::Transcribe.empty_formats_error()))?;
@@ -726,8 +1024,10 @@ impl MediaProxy {
     async fn fetch_best_innertube_player_response(
         &self,
         video_id: &str,
-    ) -> Result<(String, Value, Vec<Value>), String> {
-        let mut fallback: Option<(String, Value)> = None;
+    ) -> Result<(String, Value, Vec<Value>), YoutubeResolveError> {
+        let mut streaming_fallback: Option<(String, Value)> = None;
+        let mut non_auth_fallback: Option<(String, Value)> = None;
+        let mut auth_block: Option<YoutubeAuthBlock> = None;
         let mut attempts = Vec::new();
 
         for client in innertube_clients() {
@@ -741,21 +1041,46 @@ impl MediaProxy {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
+                    let reason = playability_reason(&player_response);
+                    let subreason = playability_subreason(&player_response);
                     let has_streaming_data = player_response.get("streamingData").is_some();
                     let has_video_streams = player_response_has_streams(&player_response);
+                    let has_streamable_video =
+                        player_response_has_streamable_video(&player_response);
+                    let has_streamable_audio =
+                        player_response_has_streamable_audio(&player_response);
+                    let needs_challenge = player_response_needs_challenge(&player_response);
+                    let auth = player_response_auth_block(&player_response);
+                    if let Some(auth) = &auth {
+                        if auth_block
+                            .as_ref()
+                            .map_or(true, |current| auth.bot_check && !current.bot_check)
+                        {
+                            auth_block = Some(auth.clone());
+                        }
+                    }
                     attempts.push(json!({
                         "client": client.id,
                         "status": if status.is_empty() { Value::Null } else { Value::String(status.clone()) },
+                        "reason": reason.clone().map(Value::String).unwrap_or(Value::Null),
+                        "subreason": subreason.clone().map(Value::String).unwrap_or(Value::Null),
                         "hasStreamingData": has_streaming_data,
                         "hasVideoStreams": has_video_streams,
+                        "hasStreamableVideo": has_streamable_video,
+                        "hasStreamableAudio": has_streamable_audio,
+                        "requiresChallenge": needs_challenge,
+                        "authRequired": auth.is_some(),
+                        "botCheck": auth.as_ref().is_some_and(|auth| auth.bot_check),
                     }));
-                    fallback = Some((format!("innertube_{}", client.id), player_response.clone()));
-                    if has_video_streams && !player_response_needs_challenge(&player_response) {
-                        return Ok((
-                            format!("innertube_{}", client.id),
-                            player_response,
-                            attempts,
-                        ));
+                    let resolver = format!("innertube_{}", client.id);
+                    if auth.is_none() {
+                        non_auth_fallback = Some((resolver.clone(), player_response.clone()));
+                        if has_streamable_video || has_streamable_audio {
+                            streaming_fallback = Some((resolver.clone(), player_response.clone()));
+                        }
+                    }
+                    if auth.is_none() && has_streamable_video {
+                        return Ok((resolver, player_response, attempts));
                     }
                 }
                 Err(error) => {
@@ -767,27 +1092,19 @@ impl MediaProxy {
             }
         }
 
-        if let Some((resolver, player_response)) = fallback {
+        if let Some((resolver, player_response)) = streaming_fallback {
             return Ok((resolver, player_response, attempts));
         }
 
-        let summary = attempts
-            .iter()
-            .map(|attempt| {
-                let client = attempt
-                    .get("client")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let status = attempt
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .or_else(|| attempt.get("error").and_then(Value::as_str))
-                    .unwrap_or("unknown");
-                format!("{client}: {status}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(format!("all InnerTube clients failed ({summary})"))
+        if auth_block.is_some() {
+            return Err(YoutubeResolveError::auth_required(auth_block, attempts));
+        }
+
+        if let Some((resolver, player_response)) = non_auth_fallback {
+            return Ok((resolver, player_response, attempts));
+        }
+
+        Err(YoutubeResolveError::all_failed(attempts))
     }
 
     async fn fetch_innertube_player_response(
@@ -796,18 +1113,21 @@ impl MediaProxy {
         client: &InnertubeClient,
     ) -> Result<Value, String> {
         let mut context = json!({ "client": client.context.clone() });
-        let visitor_data = if client.id == "android_vr" {
-            let visitor_data = self.fetch_youtube_visitor_data(video_id).await?;
-            context["client"]["visitorData"] = Value::String(visitor_data.clone());
-            Some(visitor_data)
+        let visitor_data = if let Some(visitor_data) = &self.youtube.visitor_data {
+            Some(visitor_data.clone())
+        } else if client.id == "android_vr" {
+            Some(self.fetch_youtube_visitor_data(video_id).await?)
         } else {
             None
         };
+        if let Some(visitor_data) = &visitor_data {
+            context["client"]["visitorData"] = Value::String(visitor_data.clone());
+        }
         if let Some(third_party) = client.third_party.clone() {
             context["thirdParty"] = third_party;
         }
 
-        let body = json!({
+        let mut body = json!({
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true,
@@ -818,26 +1138,30 @@ impl MediaProxy {
                 }
             }
         });
-        let endpoint = if client.id == "android_vr" {
-            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false".to_string()
-        } else {
-            format!("https://youtubei.googleapis.com/youtubei/v1/player?key={YOUTUBE_WEB_API_KEY}")
-        };
+        if let Some(po_token) = &self.youtube.player_po_token {
+            body["serviceIntegrityDimensions"] = json!({ "poToken": po_token });
+        }
+
+        let endpoint = format!(
+            "https://{}/youtubei/v1/player?key={YOUTUBE_WEB_API_KEY}&prettyPrint=false",
+            client.api_host
+        );
+        let endpoint_url = Url::parse(&endpoint).map_err(|error| error.to_string())?;
         let mut request = self
             .client
-            .post(endpoint)
+            .post(endpoint_url.clone())
             .header(reqwest::header::USER_AGENT, client.user_agent)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ORIGIN, "https://www.youtube.com")
             .header(reqwest::header::REFERER, "https://www.youtube.com/");
-        if client.id == "android_vr" {
-            request = request
-                .header("x-youtube-client-name", "28")
-                .header("x-youtube-client-version", "1.65.10");
-            if let Some(visitor_data) = visitor_data {
-                request = request.header("x-goog-visitor-id", visitor_data);
-            }
+        request = request
+            .header("x-youtube-client-name", client.client_header_name)
+            .header("x-youtube-client-version", client.client_header_version);
+        if let Some(visitor_data) = visitor_data {
+            request = request.header("x-goog-visitor-id", visitor_data);
         }
+        request =
+            self.apply_youtube_api_auth_headers(request, &endpoint_url, "https://www.youtube.com");
         let response = request
             .json(&body)
             .send()
@@ -917,6 +1241,8 @@ impl MediaProxy {
     ) -> Result<reqwest::Response, ProxyFetchError> {
         let mut upstream_url = initial_url;
         for _ in 0..=5 {
+            self.youtube
+                .apply_gvs_po_token_to_url_if_missing(&mut upstream_url);
             validate_upstream_url(&upstream_url).map_err(ProxyFetchError::Forbidden)?;
             validate_resolved_upstream_host(&upstream_url)
                 .await
@@ -927,6 +1253,7 @@ impl MediaProxy {
                 .request(method.clone(), upstream_url.clone())
                 .header(reqwest::header::ACCEPT_ENCODING, "identity")
                 .header(reqwest::header::USER_AGENT, &self.user_agent);
+            upstream = self.apply_youtube_cookie_header(upstream, &upstream_url);
 
             for name in [
                 "accept",
@@ -1028,6 +1355,54 @@ enum ProxyFetchError {
     BadGateway(String),
 }
 
+#[derive(Clone, Debug)]
+struct YoutubeResolveError {
+    message: String,
+    attempts: Vec<Value>,
+    auth_block: Option<YoutubeAuthBlock>,
+}
+
+#[derive(Clone, Debug)]
+struct YoutubeAuthBlock {
+    status: Option<String>,
+    reason: Option<String>,
+    subreason: Option<String>,
+    bot_check: bool,
+}
+
+impl YoutubeResolveError {
+    fn auth_required(auth_block: Option<YoutubeAuthBlock>, attempts: Vec<Value>) -> Self {
+        let message = match auth_block.as_ref().and_then(|auth| auth.reason.as_deref()) {
+            Some(reason) if !reason.trim().is_empty() => {
+                format!("YouTube requires sign-in or bot verification: {reason}")
+            }
+            _ => "YouTube requires sign-in or bot verification".to_string(),
+        };
+        Self {
+            message,
+            attempts,
+            auth_block,
+        }
+    }
+
+    fn all_failed(attempts: Vec<Value>) -> Self {
+        Self {
+            message: format!(
+                "all InnerTube clients failed ({})",
+                summarize_innertube_attempts(&attempts)
+            ),
+            attempts,
+            auth_block: None,
+        }
+    }
+}
+
+impl std::fmt::Display for YoutubeResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\"");
     let mut remaining = text;
@@ -1058,11 +1433,147 @@ fn extract_json_string_field(text: &str, field: &str) -> Option<String> {
     None
 }
 
+fn summarize_innertube_attempts(attempts: &[Value]) -> String {
+    attempts
+        .iter()
+        .map(|attempt| {
+            let client = attempt
+                .get("client")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let status = attempt
+                .get("status")
+                .and_then(Value::as_str)
+                .or_else(|| attempt.get("error").and_then(Value::as_str))
+                .unwrap_or("unknown");
+            format!("{client}: {status}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn player_response_auth_block(player_response: &Value) -> Option<YoutubeAuthBlock> {
+    let status = player_response
+        .pointer("/playabilityStatus/status")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let reason = playability_reason(player_response);
+    let subreason = playability_subreason(player_response);
+    let combined_text = [status.as_deref(), reason.as_deref(), subreason.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let login_required = status
+        .as_deref()
+        .is_some_and(|status| status == "LOGIN_REQUIRED")
+        || combined_text.contains("sign in");
+    let bot_check = combined_text.contains("not a bot") || combined_text.contains("bot check");
+
+    (login_required || bot_check).then_some(YoutubeAuthBlock {
+        status,
+        reason,
+        subreason,
+        bot_check,
+    })
+}
+
+fn playability_reason(player_response: &Value) -> Option<String> {
+    player_response
+        .pointer("/playabilityStatus/reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            renderer_text(
+                player_response
+                    .pointer("/playabilityStatus/errorScreen/playerErrorMessageRenderer/reason"),
+            )
+        })
+}
+
+fn playability_subreason(player_response: &Value) -> Option<String> {
+    renderer_text(
+        player_response
+            .pointer("/playabilityStatus/errorScreen/playerErrorMessageRenderer/subreason"),
+    )
+}
+
+fn renderer_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    if let Some(text) = value.get("simpleText").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    let text = value
+        .get("runs")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|run| run.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    (!text.trim().is_empty()).then(|| text)
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn sid_authorization_part(scheme: &str, sid: &str, origin: &str, timestamp: u64) -> String {
+    let hash_input = format!("{timestamp} {sid} {origin}");
+    let digest = Sha1::digest(hash_input.as_bytes());
+    format!("{scheme} {timestamp}_{digest:x}")
+}
+
+fn append_gvs_po_token_to_player_response(player_response: &mut Value, po_token: &str) {
+    for path in ["/streamingData/formats", "/streamingData/adaptiveFormats"] {
+        let Some(formats) = player_response
+            .pointer_mut(path)
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for format in formats {
+            append_gvs_po_token_to_format(format, po_token);
+        }
+    }
+}
+
+fn append_gvs_po_token_to_format(format: &mut Value, po_token: &str) {
+    let Some(url_value) = format.get_mut("url") else {
+        return;
+    };
+    let Some(url) = url_value.as_str() else {
+        return;
+    };
+    let Ok(mut parsed) = Url::parse(url) else {
+        return;
+    };
+    append_gvs_po_token_to_url(&mut parsed, po_token);
+    *url_value = Value::String(parsed.to_string());
+}
+
+fn append_gvs_po_token_to_url(url: &mut Url, po_token: &str) {
+    if !is_googlevideo_host(url.host_str().unwrap_or_default())
+        || url.query_pairs().any(|(key, _)| key == "pot")
+    {
+        return;
+    }
+    url.query_pairs_mut().append_pair("pot", po_token);
+}
+
 struct InnertubeClient {
     id: &'static str,
     user_agent: &'static str,
     context: Value,
     third_party: Option<Value>,
+    api_host: &'static str,
+    client_header_name: &'static str,
+    client_header_version: &'static str,
 }
 
 fn innertube_clients() -> Vec<InnertubeClient> {
@@ -1083,6 +1594,84 @@ fn innertube_clients() -> Vec<InnertubeClient> {
                 "gl": "US"
             }),
             third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "28",
+            client_header_version: "1.65.10",
+        },
+        InnertubeClient {
+            id: "web_safari",
+            user_agent: WEB_SAFARI_USER_AGENT,
+            context: json!({
+                "clientName": "WEB",
+                "clientVersion": "2.20260114.08.00",
+                "userAgent": WEB_SAFARI_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "1",
+            client_header_version: "2.20260114.08.00",
+        },
+        InnertubeClient {
+            id: "web_embedded",
+            user_agent: DEFAULT_USER_AGENT,
+            context: json!({
+                "clientName": "WEB_EMBEDDED_PLAYER",
+                "clientVersion": "1.20260115.01.00",
+                "userAgent": DEFAULT_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: Some(json!({"embedUrl": "https://www.youtube.com"})),
+            api_host: "www.youtube.com",
+            client_header_name: "56",
+            client_header_version: "1.20260115.01.00",
+        },
+        InnertubeClient {
+            id: "mweb",
+            user_agent: MWEB_USER_AGENT,
+            context: json!({
+                "clientName": "MWEB",
+                "clientVersion": "2.20260115.01.00",
+                "userAgent": MWEB_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "2",
+            client_header_version: "2.20260115.01.00",
+        },
+        InnertubeClient {
+            id: "tv",
+            user_agent: TV_USER_AGENT,
+            context: json!({
+                "clientName": "TVHTML5",
+                "clientVersion": "7.20260114.12.00",
+                "userAgent": TV_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "7",
+            client_header_version: "7.20260114.12.00",
+        },
+        InnertubeClient {
+            id: "tv_simply",
+            user_agent: TV_USER_AGENT,
+            context: json!({
+                "clientName": "TVHTML5_SIMPLY",
+                "clientVersion": "1.0",
+                "userAgent": TV_USER_AGENT,
+                "hl": "en",
+                "gl": "US"
+            }),
+            third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "75",
+            client_header_version: "1.0",
         },
         InnertubeClient {
             id: "android",
@@ -1100,6 +1689,9 @@ fn innertube_clients() -> Vec<InnertubeClient> {
                 "gl": "US"
             }),
             third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "3",
+            client_header_version: "21.03.36",
         },
         InnertubeClient {
             id: "android_embedded",
@@ -1118,34 +1710,40 @@ fn innertube_clients() -> Vec<InnertubeClient> {
                 "gl": "US"
             }),
             third_party: Some(json!({"embedUrl": "https://www.youtube.com"})),
+            api_host: "www.youtube.com",
+            client_header_name: "3",
+            client_header_version: "21.03.36",
         },
         InnertubeClient {
             id: "ios",
             user_agent: IOS_USER_AGENT,
             context: json!({
-                "clientName": "iOS",
-                "clientVersion": "20.11.6",
+                "clientName": "IOS",
+                "clientVersion": "21.02.3",
                 "deviceMake": "Apple",
-                "deviceModel": "iPhone10,4",
-                "osName": "iOS",
-                "osVersion": "16.7.7.20H330",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
                 "platform": "MOBILE",
                 "userAgent": IOS_USER_AGENT,
                 "hl": "en",
                 "gl": "US"
             }),
             third_party: None,
+            api_host: "www.youtube.com",
+            client_header_name: "5",
+            client_header_version: "21.02.3",
         },
         InnertubeClient {
             id: "ios_embedded",
             user_agent: IOS_USER_AGENT,
             context: json!({
-                "clientName": "iOS",
-                "clientVersion": "20.11.6",
+                "clientName": "IOS",
+                "clientVersion": "21.02.3",
                 "deviceMake": "Apple",
-                "deviceModel": "iPhone10,4",
-                "osName": "iOS",
-                "osVersion": "16.7.7.20H330",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
                 "platform": "MOBILE",
                 "clientScreen": "EMBED",
                 "userAgent": IOS_USER_AGENT,
@@ -1153,6 +1751,9 @@ fn innertube_clients() -> Vec<InnertubeClient> {
                 "gl": "US"
             }),
             third_party: Some(json!({"embedUrl": "https://www.youtube.com"})),
+            api_host: "www.youtube.com",
+            client_header_name: "5",
+            client_header_version: "21.02.3",
         },
     ]
 }
@@ -1406,6 +2007,11 @@ fn is_youtube_host(hostname: &str) -> bool {
         || host.ends_with(".youtu.be")
 }
 
+fn is_googlevideo_host(hostname: &str) -> bool {
+    let host = hostname.to_ascii_lowercase();
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
+}
+
 fn extract_youtube_id(url: &Url) -> Option<String> {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     if host == "youtu.be" || host.ends_with(".youtu.be") {
@@ -1444,8 +2050,8 @@ fn query_resolve_mode(query: &str) -> Option<ResolveMode> {
 
 fn player_response_has_formats_for_mode(player_response: &Value, mode: ResolveMode) -> bool {
     match mode {
-        ResolveMode::Full => player_response_has_streams(player_response),
-        ResolveMode::Transcribe => iter_player_formats(player_response).any(format_has_audio),
+        ResolveMode::Full => player_response_has_streamable_video(player_response),
+        ResolveMode::Transcribe => player_response_has_streamable_audio(player_response),
     }
 }
 
@@ -1456,6 +2062,26 @@ fn player_response_has_streams(player_response: &Value) -> bool {
             .and_then(Value::as_str)
             .is_some_and(|mime| mime.starts_with("video/"))
     })
+}
+
+fn player_response_has_streamable_video(player_response: &Value) -> bool {
+    player_response_has_streamable_manifest(player_response)
+        || iter_player_formats(player_response).any(streamable_video_format)
+}
+
+fn player_response_has_streamable_audio(player_response: &Value) -> bool {
+    iter_player_formats(player_response).any(streamable_audio_format)
+}
+
+fn player_response_has_streamable_manifest(player_response: &Value) -> bool {
+    player_response
+        .pointer("/streamingData/hlsManifestUrl")
+        .and_then(Value::as_str)
+        .is_some_and(|url| Url::parse(url).is_ok())
+        || player_response
+            .pointer("/streamingData/dashManifestUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|url| Url::parse(url).is_ok())
 }
 
 fn player_response_needs_challenge(player_response: &Value) -> bool {
@@ -1475,6 +2101,43 @@ fn iter_player_formats(player_response: &Value) -> impl Iterator<Item = &Value> 
                 .into_iter()
                 .flatten(),
         )
+}
+
+fn normalize_player_response_for_streaming(player_response: &mut Value) {
+    let Some(streaming_data) = player_response
+        .get_mut("streamingData")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for key in ["formats", "adaptiveFormats"] {
+        let Some(formats) = streaming_data.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        formats.retain(|format| streamable_media_format(format));
+    }
+}
+
+fn streamable_media_format(format: &Value) -> bool {
+    (format_has_audio(format) || format_has_video(format))
+        && format_has_direct_streamable_url(format)
+}
+
+fn streamable_video_format(format: &Value) -> bool {
+    format_has_video(format) && format_has_direct_streamable_url(format)
+}
+
+fn streamable_audio_format(format: &Value) -> bool {
+    format_has_audio(format) && format_has_direct_streamable_url(format)
+}
+
+fn streamable_muxed_format(format: &Value) -> bool {
+    format_has_audio(format) && format_has_video(format) && format_has_direct_streamable_url(format)
+}
+
+fn format_has_direct_streamable_url(format: &Value) -> bool {
+    format.get("url").and_then(Value::as_str).is_some() && !format_needs_challenge(format)
 }
 
 fn apply_transcribe_resolve_mode(player_response: &mut Value) {
@@ -1558,7 +2221,7 @@ fn select_transcribe_media_source(
     resolver: &str,
 ) -> Option<TranscribeMediaSource> {
     iter_player_formats(player_response)
-        .filter(|format| format_has_audio(format))
+        .filter(|format| streamable_audio_format(format))
         .filter_map(|format| {
             let url = format.get("url").and_then(Value::as_str)?;
             let url = Url::parse(url).ok()?;
@@ -1577,6 +2240,98 @@ fn select_transcribe_media_source(
         })
         .min_by_key(|(score, _source)| *score)
         .map(|(_score, source)| source)
+}
+
+fn stream_summary_json(player_response: &Value, resolver: &str) -> Value {
+    json!({
+        "muxed": select_best_stream_format(player_response, streamable_muxed_format, muxed_stream_score)
+            .map(|format| stream_format_json(format, resolver))
+            .unwrap_or(Value::Null),
+        "video": select_best_stream_format(player_response, streamable_video_format, video_stream_score)
+            .map(|format| stream_format_json(format, resolver))
+            .unwrap_or(Value::Null),
+        "audio": select_best_stream_format(player_response, streamable_audio_format, audio_stream_score)
+            .map(|format| stream_format_json(format, resolver))
+            .unwrap_or(Value::Null),
+        "hls": manifest_stream_json(player_response, "/streamingData/hlsManifestUrl", "application/vnd.apple.mpegurl", resolver),
+        "dash": manifest_stream_json(player_response, "/streamingData/dashManifestUrl", "application/dash+xml", resolver),
+    })
+}
+
+fn select_best_stream_format(
+    player_response: &Value,
+    predicate: fn(&Value) -> bool,
+    score: fn(&Value) -> (u64, u64, u64),
+) -> Option<&Value> {
+    iter_player_formats(player_response)
+        .filter(|format| predicate(format))
+        .max_by_key(|format| score(format))
+}
+
+fn stream_format_json(format: &Value, resolver: &str) -> Value {
+    json!({
+        "url": format.get("url").and_then(Value::as_str).unwrap_or_default(),
+        "proxiedUrl": format!("/proxy?url={}", percent_encode_query_component(format.get("url").and_then(Value::as_str).unwrap_or_default())),
+        "resolver": resolver,
+        "itag": format_u64(format, "itag"),
+        "mimeType": format.get("mimeType").and_then(Value::as_str),
+        "width": format_u64(format, "width"),
+        "height": format_u64(format, "height"),
+        "fps": format_u64(format, "fps"),
+        "bitrate": format_u64(format, "bitrate"),
+        "audioQuality": format.get("audioQuality").and_then(Value::as_str),
+    })
+}
+
+fn manifest_stream_json(
+    player_response: &Value,
+    pointer: &str,
+    mime_type: &str,
+    resolver: &str,
+) -> Value {
+    let Some(url) = player_response.pointer(pointer).and_then(Value::as_str) else {
+        return Value::Null;
+    };
+    if Url::parse(url).is_err() {
+        return Value::Null;
+    }
+    json!({
+        "url": url,
+        "proxiedUrl": format!("/proxy?url={}", percent_encode_query_component(url)),
+        "resolver": resolver,
+        "mimeType": mime_type,
+    })
+}
+
+fn muxed_stream_score(format: &Value) -> (u64, u64, u64) {
+    (
+        format_pixels(format),
+        format_u64(format, "bitrate").unwrap_or(0),
+        format_u64(format, "fps").unwrap_or(0),
+    )
+}
+
+fn video_stream_score(format: &Value) -> (u64, u64, u64) {
+    (
+        format_pixels(format),
+        format_u64(format, "bitrate").unwrap_or(0),
+        format_u64(format, "fps").unwrap_or(0),
+    )
+}
+
+fn audio_stream_score(format: &Value) -> (u64, u64, u64) {
+    (
+        u64::MAX.saturating_sub(transcribe_codec_score(format) as u64),
+        format_u64(format, "bitrate").unwrap_or(0),
+        format_u64(format, "contentLength").unwrap_or(0),
+    )
+}
+
+fn format_pixels(format: &Value) -> u64 {
+    format_u64(format, "width")
+        .zip(format_u64(format, "height"))
+        .map(|(width, height)| width.saturating_mul(height))
+        .unwrap_or(0)
 }
 
 fn transcribe_media_score(format: &Value) -> (u8, u8, u64, u64, u64) {
@@ -1625,7 +2380,7 @@ fn select_best_innertube_frame_media_source(
 ) -> Option<FrameMediaSource> {
     iter_player_formats(player_response)
         .filter_map(|format| {
-            if !is_native_frame_format(format) {
+            if !is_native_frame_format(format) || !format_has_direct_streamable_url(format) {
                 return None;
             }
             let url = format.get("url").and_then(Value::as_str)?;
@@ -2235,6 +2990,7 @@ async fn run(config: AppConfig) -> Result<()> {
     if config.local_http {
         let router = Arc::new(MediaProxy::new(
             config.user_agent.clone(),
+            config.youtube.clone(),
             config.ytdlp.clone(),
             config.resolve_mode,
         )?);
@@ -2244,6 +3000,7 @@ async fn run(config: AppConfig) -> Result<()> {
     let (cert, key) = config.tls_base64()?;
     let router = Box::new(MediaProxy::new(
         config.user_agent.clone(),
+        config.youtube.clone(),
         config.ytdlp.clone(),
         config.resolve_mode,
     )?);
@@ -2328,6 +3085,210 @@ mod tests {
         assert!(rewritten.contains("#EXT-X-MAP:URI=\"/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Finit.mp4\""));
         assert!(rewritten.contains("/proxy?url=https%3A%2F%2Fmanifest.googlevideo.com%2Fapi%2Fmanifest%2Fhls_playlist%2Fseg-1.m4s"));
         assert!(rewritten.contains("/proxy?url=https%3A%2F%2Frr1---sn.googlevideo.com%2Fvideoplayback%3Fid%3D1%26itag%3D137"));
+    }
+
+    #[test]
+    fn parses_netscape_youtube_cookies_and_generates_sid_auth() {
+        let jar = YoutubeCookieJar::parse_netscape(
+            "# Netscape HTTP Cookie File\n\
+             #HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tLOGIN_INFO\tlogin\n\
+             .youtube.com\tTRUE\t/\tTRUE\t1893456000\tSAPISID\tsid\n\
+             .youtube.com\tTRUE\t/\tTRUE\t1893456000\t__Secure-3PAPISID\tsid3\n",
+        )
+        .unwrap();
+        let youtube_url = Url::parse("https://www.youtube.com/watch?v=cEA72uBe3Sw").unwrap();
+        let cookie_header = jar.header_for_url(&youtube_url).unwrap();
+
+        assert!(cookie_header.contains("LOGIN_INFO=login"));
+        assert!(cookie_header.contains("SAPISID=sid"));
+        assert!(jar.has_auth_cookies());
+        assert_eq!(
+            jar.sid_authorization_header("https://www.youtube.com", 1_700_000_000),
+            Some(
+                "SAPISIDHASH 1700000000_74cf24f8fc8e15eb74dbc3bc9bbde6fa183ce16a SAPISID3PHASH 1700000000_9bce9e11f48f6d7262b99135d7a504d8512f9a67"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn detects_youtube_login_bot_check_response() {
+        let value = json!({
+            "playabilityStatus": {
+                "status": "LOGIN_REQUIRED",
+                "reason": "Sign in to confirm you’re not a bot",
+                "errorScreen": {
+                    "playerErrorMessageRenderer": {
+                        "subreason": {
+                            "runs": [
+                                {"text": "This helps protect our community. "},
+                                {"text": "Learn more"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let block = player_response_auth_block(&value).unwrap();
+        assert_eq!(block.status.as_deref(), Some("LOGIN_REQUIRED"));
+        assert_eq!(
+            block.reason.as_deref(),
+            Some("Sign in to confirm you’re not a bot")
+        );
+        assert_eq!(
+            block.subreason.as_deref(),
+            Some("This helps protect our community. Learn more")
+        );
+        assert!(block.bot_check);
+    }
+
+    #[test]
+    fn appends_gvs_po_token_to_googlevideo_format_urls() {
+        let mut value = json!({
+            "streamingData": {
+                "formats": [
+                    {
+                        "itag": 18,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=18"
+                    },
+                    {
+                        "itag": 22,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=22&pot=existing"
+                    }
+                ],
+                "adaptiveFormats": [
+                    {
+                        "itag": 251,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=251"
+                    }
+                ]
+            }
+        });
+
+        append_gvs_po_token_to_player_response(&mut value, "native-token");
+
+        assert!(value
+            .pointer("/streamingData/formats/0/url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("pot=native-token"));
+        assert!(value
+            .pointer("/streamingData/formats/1/url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("pot=existing"));
+        assert!(value
+            .pointer("/streamingData/adaptiveFormats/0/url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("pot=native-token"));
+    }
+
+    #[test]
+    fn normalizes_player_response_to_streamable_direct_formats() {
+        let mut value = json!({
+            "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/test",
+                "formats": [
+                    {
+                        "itag": 18,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=18",
+                        "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                        "width": 640,
+                        "height": 360,
+                        "audioQuality": "AUDIO_QUALITY_LOW"
+                    },
+                    {
+                        "itag": 22,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=22&n=abc",
+                        "mimeType": "video/mp4; codecs=\"avc1.64001F, mp4a.40.2\"",
+                        "width": 1280,
+                        "height": 720,
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+                    },
+                    {
+                        "itag": 37,
+                        "signatureCipher": "url=https%3A%2F%2Frr1---sn.googlevideo.com%2Fvideoplayback%3Fitag%3D37&s=abc&sp=sig",
+                        "mimeType": "video/mp4; codecs=\"avc1.640028, mp4a.40.2\"",
+                        "width": 1920,
+                        "height": 1080,
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+                    }
+                ],
+                "adaptiveFormats": [
+                    {
+                        "itag": 251,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=251&n=abc",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+                    }
+                ]
+            }
+        });
+
+        normalize_player_response_for_streaming(&mut value);
+
+        let formats = value
+            .pointer("/streamingData/formats")
+            .and_then(Value::as_array)
+            .unwrap();
+        let adaptive = value
+            .pointer("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].get("itag").and_then(Value::as_i64), Some(18));
+        assert!(adaptive.is_empty());
+        assert!(player_response_has_streamable_video(&value));
+        assert!(stream_summary_json(&value, "test")
+            .pointer("/muxed/url")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("itag=18"));
+    }
+
+    #[test]
+    fn full_resolve_accepts_manifest_only_streaming_data() {
+        let value = json!({
+            "streamingData": {
+                "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/test"
+            }
+        });
+
+        assert!(player_response_has_formats_for_mode(
+            &value,
+            ResolveMode::Full
+        ));
+        assert!(!player_response_has_formats_for_mode(
+            &value,
+            ResolveMode::Transcribe
+        ));
+    }
+
+    #[test]
+    fn transcribe_media_source_skips_challenged_audio_urls() {
+        let value = json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "itag": 251,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=251&n=abc",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+                    },
+                    {
+                        "itag": 140,
+                        "url": "https://rr1---sn.googlevideo.com/videoplayback?itag=140",
+                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                        "audioQuality": "AUDIO_QUALITY_MEDIUM"
+                    }
+                ]
+            }
+        });
+
+        let source = select_transcribe_media_source(&value, "test").unwrap();
+        assert_eq!(source.itag, Some(140));
     }
 
     #[test]

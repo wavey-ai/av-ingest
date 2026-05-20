@@ -110,16 +110,33 @@ AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS=45
 AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS='youtube:player_client=mweb'
 AV_INGEST_PROXY_YTDLP_COOKIES=/path/to/cookies.txt
 AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER=chrome
+AV_INGEST_PROXY_YOUTUBE_COOKIES=/path/to/cookies.txt
+AV_INGEST_PROXY_YOUTUBE_VISITOR_DATA=...
+AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN=...
+AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN=...
 AV_INGEST_PROXY_RESOLVE_MODE=transcribe
 ```
+
+The native Rust YouTube resolver reads Netscape-format cookies from
+`AV_INGEST_PROXY_YOUTUBE_COOKIES`. If that is unset, it reuses
+`AV_INGEST_PROXY_YTDLP_COOKIES`. Auth cookies are sent to YouTube requests and
+used to generate SAPISID InnerTube authorization headers.
 
 When YouTube requires GVS PO tokens, configure `yt-dlp` the same way you would on
 the command line, for example through `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` and
 an installed `yt-dlp` PO-token provider plugin.
+For the native resolver, pass known PO tokens through
+`AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN` and
+`AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN`; the GVS token is appended to resolved
+Google Video format URLs.
 
 Use `AV_INGEST_PROXY_RESOLVE_MODE=transcribe` for ASR-only jobs. `/resolve`
 then returns audio-only formats when YouTube provides them. If no audio-only
 format is available, it keeps only the smallest muxed audio/video format.
+The native resolver removes direct formats that still require YouTube JS
+signature or `n` challenge solving, but it keeps streamable direct audio/video
+URLs plus HLS/DASH manifest URLs. `/resolve` also includes a `streams` summary
+with best muxed, video-only, audio-only, HLS, and DASH candidates when present.
 
 ## Notes
 
