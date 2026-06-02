@@ -71,6 +71,7 @@ struct YtDlpConfig {
 #[derive(Clone, Debug, Default)]
 struct YoutubeConfig {
     cookies_path: Option<String>,
+    cookie_header: Option<String>,
     cookies: YoutubeCookieJar,
     visitor_data: Option<String>,
     player_po_token: Option<String>,
@@ -177,26 +178,41 @@ impl AppConfig {
 
 impl YoutubeConfig {
     fn from_env(ytdlp: &YtDlpConfig) -> Result<Self> {
+        let extractor_args = ytdlp
+            .extractor_args
+            .as_deref()
+            .map(parse_youtube_extractor_args)
+            .unwrap_or_default();
         let cookies_path =
             env_nonempty("AV_INGEST_PROXY_YOUTUBE_COOKIES").or_else(|| ytdlp.cookies.clone());
-        let cookies = match &cookies_path {
+        let cookie_header = env_nonempty("AV_INGEST_PROXY_YOUTUBE_COOKIE_HEADER");
+        let mut cookies = match &cookies_path {
             Some(path) => YoutubeCookieJar::from_netscape_file(path)
                 .with_context(|| format!("failed to load YouTube cookies from {path}"))?,
             None => YoutubeCookieJar::default(),
         };
+        if let Some(cookie_header) = &cookie_header {
+            cookies.extend(YoutubeCookieJar::parse_cookie_header(cookie_header));
+        }
 
         Ok(Self {
             cookies_path,
+            cookie_header,
             cookies,
-            visitor_data: env_nonempty("AV_INGEST_PROXY_YOUTUBE_VISITOR_DATA"),
-            player_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN"),
-            gvs_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN"),
+            visitor_data: env_nonempty("AV_INGEST_PROXY_YOUTUBE_VISITOR_DATA")
+                .or(extractor_args.visitor_data),
+            player_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN")
+                .or(extractor_args.player_po_token),
+            gvs_po_token: env_nonempty("AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN")
+                .or(extractor_args.gvs_po_token),
         })
     }
 
     fn auth_state_json(&self) -> Value {
         json!({
-            "cookiesConfigured": self.cookies_path.is_some(),
+            "cookiesConfigured": self.cookies_path.is_some() || self.cookie_header.is_some(),
+            "cookieFileConfigured": self.cookies_path.is_some(),
+            "cookieHeaderConfigured": self.cookie_header.is_some(),
             "authCookiesPresent": self.cookies.has_auth_cookies(),
             "visitorDataConfigured": self.visitor_data.is_some(),
             "playerPoTokenConfigured": self.player_po_token.is_some(),
@@ -235,6 +251,39 @@ impl YoutubeCookieJar {
     fn from_netscape_file(path: &str) -> Result<Self> {
         let contents = fs::read_to_string(path)?;
         Self::parse_netscape(&contents)
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.cookies.extend(other.cookies);
+    }
+
+    fn parse_cookie_header(header: &str) -> Self {
+        let header = header
+            .trim()
+            .strip_prefix("Cookie:")
+            .unwrap_or_else(|| header.trim())
+            .trim();
+        let cookies = header
+            .split(';')
+            .filter_map(|part| {
+                let (name, value) = part.trim().split_once('=')?;
+                let name = name.trim();
+                if name.is_empty() {
+                    return None;
+                }
+                Some(YoutubeCookie {
+                    domain: "youtube.com".to_string(),
+                    include_subdomains: true,
+                    path: "/".to_string(),
+                    secure: true,
+                    expires: None,
+                    name: name.to_string(),
+                    value: value.trim().to_string(),
+                })
+            })
+            .collect();
+
+        Self { cookies }
     }
 
     fn parse_netscape(contents: &str) -> Result<Self> {
@@ -351,6 +400,89 @@ impl YoutubeCookie {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct YoutubeExtractorArgs {
+    visitor_data: Option<String>,
+    player_po_token: Option<String>,
+    gvs_po_token: Option<String>,
+}
+
+fn parse_youtube_extractor_args(value: &str) -> YoutubeExtractorArgs {
+    let mut args = YoutubeExtractorArgs::default();
+    for segment in value.split_whitespace() {
+        let Some(raw_args) = segment.strip_prefix("youtube:") else {
+            continue;
+        };
+        for entry in raw_args.split(';') {
+            let Some((key, raw_value)) = entry.split_once('=') else {
+                continue;
+            };
+            match key.trim() {
+                "visitor_data" => {
+                    if args.visitor_data.is_none() {
+                        args.visitor_data = first_arg_value(raw_value);
+                    }
+                }
+                "po_token" => {
+                    apply_po_token_arg(raw_value, &mut args);
+                }
+                _ => {}
+            }
+        }
+    }
+    args
+}
+
+fn first_arg_value(raw_value: &str) -> Option<String> {
+    raw_value
+        .split(',')
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(percent_decode_no_plus)
+}
+
+fn apply_po_token_arg(raw_value: &str, args: &mut YoutubeExtractorArgs) {
+    for token_arg in raw_value.split(',').map(str::trim) {
+        let Some((metadata, token)) = token_arg.split_once('+') else {
+            continue;
+        };
+        let token = percent_decode_no_plus(token.trim());
+        if token.is_empty() {
+            continue;
+        }
+        let context = metadata
+            .rsplit_once('.')
+            .map(|(_, context)| context)
+            .unwrap_or("gvs")
+            .to_ascii_lowercase();
+        match context.as_str() {
+            "player" if args.player_po_token.is_none() => args.player_po_token = Some(token),
+            "gvs" if args.gvs_po_token.is_none() => args.gvs_po_token = Some(token),
+            _ => {}
+        }
+    }
+}
+
+fn percent_decode_no_plus(value: &str) -> String {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    out.push(decoded);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| value.to_string())
+}
+
 #[derive(Clone)]
 struct MediaProxy {
     client: reqwest::Client,
@@ -372,6 +504,91 @@ pub struct TranscribeAudioStream {
     pub itag: Option<u64>,
     pub mime_type: Option<String>,
     response: reqwest::Response,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddedResolveMode {
+    Full,
+    Transcribe,
+}
+
+impl From<EmbeddedResolveMode> for ResolveMode {
+    fn from(value: EmbeddedResolveMode) -> Self {
+        match value {
+            EmbeddedResolveMode::Full => Self::Full,
+            EmbeddedResolveMode::Transcribe => Self::Transcribe,
+        }
+    }
+}
+
+pub struct EmbeddedAvIngestConfig {
+    pub user_agent: Option<String>,
+    pub ytdlp_enabled: bool,
+    pub resolve_mode: EmbeddedResolveMode,
+}
+
+pub struct EmbeddedAvIngestRequest {
+    pub method: String,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+}
+
+pub struct EmbeddedAvIngestResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+    pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
+}
+
+pub struct EmbeddedAvIngest {
+    proxy: MediaProxy,
+}
+
+impl EmbeddedAvIngest {
+    pub fn new(config: EmbeddedAvIngestConfig) -> Result<Self> {
+        let mut app_config = AppConfig::from_env()?;
+        if let Some(user_agent) = config.user_agent {
+            app_config.user_agent = user_agent;
+        }
+        app_config.ytdlp.enabled = config.ytdlp_enabled;
+        app_config.resolve_mode = config.resolve_mode.into();
+        Ok(Self {
+            proxy: MediaProxy::new(
+                app_config.user_agent,
+                app_config.youtube,
+                app_config.ytdlp,
+                app_config.resolve_mode,
+            )?,
+        })
+    }
+
+    pub async fn handle_request(
+        &self,
+        request: EmbeddedAvIngestRequest,
+    ) -> Result<EmbeddedAvIngestResponse> {
+        let method = Method::from_bytes(request.method.as_bytes())
+            .with_context(|| format!("invalid embedded request method: {}", request.method))?;
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(request.path_and_query);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
+        }
+        let request = builder
+            .body(())
+            .context("failed to build embedded av-ingest request")?;
+        let response = self
+            .proxy
+            .route(request)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        Ok(EmbeddedAvIngestResponse {
+            status: response.status.as_u16(),
+            body: response.body.unwrap_or_default().to_vec(),
+            content_type: response.content_type,
+            headers: response.headers,
+        })
+    }
 }
 
 impl TranscribeAudioResolver {
@@ -3108,6 +3325,39 @@ mod tests {
                 "SAPISIDHASH 1700000000_74cf24f8fc8e15eb74dbc3bc9bbde6fa183ce16a SAPISID3PHASH 1700000000_9bce9e11f48f6d7262b99135d7a504d8512f9a67"
                     .to_string()
             )
+        );
+    }
+
+    #[test]
+    fn parses_raw_youtube_cookie_header_and_generates_sid_auth() {
+        let jar = YoutubeCookieJar::parse_cookie_header(
+            "Cookie: LOGIN_INFO=login; SAPISID=sid; __Secure-1PAPISID=sid1",
+        );
+        let youtube_url = Url::parse("https://www.youtube.com/watch?v=cEA72uBe3Sw").unwrap();
+        let cookie_header = jar.header_for_url(&youtube_url).unwrap();
+
+        assert!(cookie_header.contains("LOGIN_INFO=login"));
+        assert!(cookie_header.contains("__Secure-1PAPISID=sid1"));
+        assert!(jar.has_auth_cookies());
+        assert!(jar
+            .sid_authorization_header("https://www.youtube.com", 1_700_000_000)
+            .unwrap()
+            .contains("SAPISID1PHASH"));
+    }
+
+    #[test]
+    fn parses_youtube_extractor_args_for_native_auth() {
+        let args = parse_youtube_extractor_args(
+            "youtube:player_client=mweb;visitor_data=VISITOR%3D;po_token=web.gvs+GVS%2Btoken,web.player+PLAYER%2Ftoken",
+        );
+
+        assert_eq!(
+            args,
+            YoutubeExtractorArgs {
+                visitor_data: Some("VISITOR=".to_string()),
+                gvs_po_token: Some("GVS+token".to_string()),
+                player_po_token: Some("PLAYER/token".to_string()),
+            }
         );
     }
 

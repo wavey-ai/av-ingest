@@ -22,7 +22,7 @@ sha1 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-web-service = { git = "https://github.com/wavey-ai/web-services.git", package = "web-service", rev = "065ccab2d5f4a61ccc0bf7b3e3d32da2759828f4" }
+web-service = { git = "https://github.com/wavey-ai/web-services.git", package = "web-service" }
 
 [build-dependencies]
 bindgen = "0.72"
