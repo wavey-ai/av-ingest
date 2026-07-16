@@ -107,6 +107,7 @@ Useful environment variables:
 AV_INGEST_PROXY_YTDLP_ENABLED=1
 AV_INGEST_PROXY_YTDLP_PATH=yt-dlp
 AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS=45
+AV_INGEST_PROXY_YTDLP_DOWNLOAD_TIMEOUT_SECS=21600
 AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS='youtube:player_client=mweb'
 AV_INGEST_PROXY_YTDLP_COOKIES=/path/to/cookies.txt
 AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER=chrome
@@ -142,6 +143,11 @@ The native resolver removes direct formats that still require YouTube JS
 signature or `n` challenge solving, but it keeps streamable direct audio/video
 URLs plus HLS/DASH manifest URLs. `/resolve` also includes a `streams` summary
 with best muxed, video-only, audio-only, HLS, and DASH candidates when present.
+
+Rust consumers can use `TranscribeAudioResolver::download_youtube_audio` for
+cache-first ASR jobs. It asks `yt-dlp` to download one original compressed audio
+format without post-processing or FFmpeg, and returns duration, format, MIME,
+and file-size metadata for local decoders such as SoundKit.
 
 ## Notes
 

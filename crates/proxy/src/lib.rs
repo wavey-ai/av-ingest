@@ -19,6 +19,7 @@ use std::convert::Infallible;
 use std::env;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,6 +67,7 @@ struct YtDlpConfig {
     cookies: Option<String>,
     cookies_from_browser: Option<String>,
     timeout: Duration,
+    download_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -141,6 +143,10 @@ impl AppConfig {
             cookies: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES"),
             cookies_from_browser: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER"),
             timeout: Duration::from_secs(env_u64("AV_INGEST_PROXY_YTDLP_TIMEOUT_SECS", 45)?),
+            download_timeout: Duration::from_secs(env_u64(
+                "AV_INGEST_PROXY_YTDLP_DOWNLOAD_TIMEOUT_SECS",
+                6 * 60 * 60,
+            )?),
         };
         let youtube = YoutubeConfig::from_env(&ytdlp)?;
 
@@ -506,6 +512,15 @@ pub struct TranscribeAudioStream {
     response: reqwest::Response,
 }
 
+pub struct DownloadedTranscribeAudio {
+    pub path: PathBuf,
+    pub duration_seconds: Option<u64>,
+    pub resolver: String,
+    pub itag: Option<u64>,
+    pub mime_type: Option<String>,
+    pub content_length: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmbeddedResolveMode {
     Full,
@@ -612,6 +627,76 @@ impl TranscribeAudioResolver {
         self.open_youtube_audio_stream(source).await
     }
 
+    pub async fn download_youtube_audio(
+        &self,
+        source: &str,
+        output_path: &Path,
+    ) -> Result<DownloadedTranscribeAudio> {
+        anyhow::ensure!(self.proxy.ytdlp.enabled, "yt-dlp resolver is disabled");
+        let source_url =
+            Url::parse(source).with_context(|| format!("invalid YouTube source URL: {source}"))?;
+        anyhow::ensure!(
+            is_youtube_host(source_url.host_str().unwrap_or_default()),
+            "Only YouTube audio sources are implemented."
+        );
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let mut command = Command::new(&self.proxy.ytdlp.path);
+        command
+            .arg("--no-playlist")
+            .arg("--no-progress")
+            .arg("--no-warnings")
+            .arg("--no-simulate")
+            .arg("--no-part")
+            .arg("--force-overwrites")
+            .arg("--print-json")
+            .arg("--format")
+            .arg("bestaudio[ext=webm]/bestaudio")
+            .arg("--output")
+            .arg(output_path);
+        apply_ytdlp_auth_args(&mut command, &self.proxy.ytdlp);
+        command
+            .arg(source_url.as_str())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let output = tokio::time::timeout(self.proxy.ytdlp.download_timeout, command.output())
+            .await
+            .with_context(|| {
+                format!(
+                    "yt-dlp audio download timed out after {:?}",
+                    self.proxy.ytdlp.download_timeout
+                )
+            })?
+            .context("yt-dlp audio download could not start")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "yt-dlp audio download exited with {}{}",
+                output.status,
+                if stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr.trim())
+                }
+            );
+        }
+        let value = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .rev()
+            .find(|line| !line.iter().all(u8::is_ascii_whitespace))
+            .context("yt-dlp audio download returned no metadata")?;
+        let value: Value = serde_json::from_slice(value)
+            .context("failed to parse yt-dlp audio download metadata")?;
+        downloaded_transcribe_audio(&value, output_path)
+    }
+
     async fn open_youtube_audio_stream(&self, source: &str) -> Result<TranscribeAudioStream> {
         let source_url =
             Url::parse(source).with_context(|| format!("invalid YouTube source URL: {source}"))?;
@@ -619,6 +704,63 @@ impl TranscribeAudioResolver {
             .open_youtube_transcribe_audio(source_url, &Method::GET, &HeaderMap::new())
             .await
     }
+}
+
+fn apply_ytdlp_auth_args(command: &mut Command, config: &YtDlpConfig) {
+    if let Some(extractor_args) = &config.extractor_args {
+        command.arg("--extractor-args").arg(extractor_args);
+    }
+    if let Some(cookies) = &config.cookies {
+        command.arg("--cookies").arg(cookies);
+    }
+    if let Some(cookies_from_browser) = &config.cookies_from_browser {
+        command
+            .arg("--cookies-from-browser")
+            .arg(cookies_from_browser);
+    }
+}
+
+fn downloaded_transcribe_audio(value: &Value, path: &Path) -> Result<DownloadedTranscribeAudio> {
+    let download = value.pointer("/requested_downloads/0").unwrap_or(value);
+    let content_length = fs::metadata(path)
+        .with_context(|| format!("yt-dlp did not create {}", path.display()))?
+        .len();
+    anyhow::ensure!(content_length > 0, "yt-dlp created an empty audio file");
+    let duration_seconds = value
+        .get("duration")
+        .and_then(Value::as_f64)
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        .map(|duration| duration.ceil() as u64);
+    let itag = download
+        .get("format_id")
+        .or_else(|| value.get("format_id"))
+        .and_then(|format| {
+            format
+                .as_u64()
+                .or_else(|| format.as_str()?.parse::<u64>().ok())
+        });
+    let extension = download
+        .get("ext")
+        .or_else(|| value.get("ext"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime_type = match extension.as_str() {
+        "webm" => Some("audio/webm".to_string()),
+        "m4a" | "mp4" => Some("audio/mp4".to_string()),
+        "ogg" | "opus" => Some("audio/ogg".to_string()),
+        "flac" => Some("audio/flac".to_string()),
+        "mp3" => Some("audio/mpeg".to_string()),
+        _ => None,
+    };
+    Ok(DownloadedTranscribeAudio {
+        path: path.to_path_buf(),
+        duration_seconds,
+        resolver: "yt-dlp-download".to_string(),
+        itag,
+        mime_type,
+        content_length,
+    })
 }
 
 impl TranscribeAudioStream {
@@ -1409,17 +1551,7 @@ impl MediaProxy {
             .arg("--no-warnings")
             .arg("--skip-download")
             .arg("--no-progress");
-        if let Some(extractor_args) = &self.ytdlp.extractor_args {
-            command.arg("--extractor-args").arg(extractor_args);
-        }
-        if let Some(cookies) = &self.ytdlp.cookies {
-            command.arg("--cookies").arg(cookies);
-        }
-        if let Some(cookies_from_browser) = &self.ytdlp.cookies_from_browser {
-            command
-                .arg("--cookies-from-browser")
-                .arg(cookies_from_browser);
-        }
+        apply_ytdlp_auth_args(&mut command, &self.ytdlp);
         command
             .arg(source_url)
             .stdin(Stdio::null())
@@ -3539,6 +3671,31 @@ mod tests {
 
         let source = select_transcribe_media_source(&value, "test").unwrap();
         assert_eq!(source.itag, Some(140));
+    }
+
+    #[test]
+    fn parses_downloaded_transcribe_audio_metadata() {
+        let path = env::temp_dir().join(format!(
+            "av-ingest-downloaded-audio-test-{}.audio",
+            std::process::id()
+        ));
+        fs::write(&path, b"webm audio bytes").unwrap();
+        let value = json!({
+            "duration": 305.2,
+            "requested_downloads": [{
+                "format_id": "251",
+                "ext": "webm"
+            }]
+        });
+
+        let audio = downloaded_transcribe_audio(&value, &path).unwrap();
+
+        assert_eq!(audio.path, path);
+        assert_eq!(audio.duration_seconds, Some(306));
+        assert_eq!(audio.itag, Some(251));
+        assert_eq!(audio.mime_type.as_deref(), Some("audio/webm"));
+        assert_eq!(audio.content_length, 16);
+        fs::remove_file(audio.path).unwrap();
     }
 
     #[test]
