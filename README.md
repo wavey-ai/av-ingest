@@ -5,7 +5,7 @@ extracting source frames by timestamp.
 
 The main consumer is a browser app that needs safe preview playback plus an exact
 source frame for rendering. Browser playback can use a lower-resolution compatible
-stream; `/frame` can use the highest-resolution source stream.
+stream.`/frame` can use the highest-resolution source stream.
 
 ## Requirements
 
@@ -126,12 +126,12 @@ used to generate SAPISID InnerTube authorization headers.
 If exporting a cookie file is inconvenient, pass a raw YouTube `Cookie` header
 through `AV_INGEST_PROXY_YOUTUBE_COOKIE_HEADER`.
 
-When YouTube requires GVS PO tokens, configure `yt-dlp` the same way you would on
-the command line, for example through `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` and
-an installed `yt-dlp` PO-token provider plugin.
+When YouTube requires GVS PO tokens, use the normal `yt-dlp` configuration. For
+example, set `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` and install a `yt-dlp`
+PO-token provider plug-in.
 For the native resolver, pass known PO tokens through
 `AV_INGEST_PROXY_YOUTUBE_PLAYER_PO_TOKEN` and
-`AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN`; the GVS token is appended to resolved
+`AV_INGEST_PROXY_YOUTUBE_GVS_PO_TOKEN`. The GVS token is appended to resolved
 Google Video format URLs.
 The native resolver also reads `visitor_data` and `po_token` entries from
 `AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS` when present.
@@ -139,10 +139,11 @@ The native resolver also reads `visitor_data` and `po_token` entries from
 Use `AV_INGEST_PROXY_RESOLVE_MODE=transcribe` for ASR-only jobs. `/resolve`
 then returns audio-only formats when YouTube provides them. If no audio-only
 format is available, it keeps only the smallest muxed audio/video format.
+
 The native resolver removes direct formats that still require YouTube JS
-signature or `n` challenge solving, but it keeps streamable direct audio/video
-URLs plus HLS/DASH manifest URLs. `/resolve` also includes a `streams` summary
-with best muxed, video-only, audio-only, HLS, and DASH candidates when present.
+signature or `n` challenge solving. It keeps streamable direct audio and video
+URLs. It also keeps HLS and DASH manifest URLs. When available, `/resolve`
+includes the best candidates in a `streams` summary.
 
 Rust consumers can use `TranscribeAudioResolver::download_youtube_audio` for
 cache-first ASR jobs. It asks `yt-dlp` to download the selected original
