@@ -45,6 +45,7 @@ const ANDROID_VR_USER_AGENT: &str =
     "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const IOS_USER_AGENT: &str =
     "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+const DEFAULT_YTDLP_AUDIO_FORMAT: &str = "bestaudio[ext=webm]/bestaudio";
 
 #[derive(Clone)]
 struct AppConfig {
@@ -63,6 +64,7 @@ struct AppConfig {
 struct YtDlpConfig {
     enabled: bool,
     path: String,
+    audio_format: String,
     extractor_args: Option<String>,
     cookies: Option<String>,
     cookies_from_browser: Option<String>,
@@ -139,6 +141,8 @@ impl AppConfig {
         let ytdlp = YtDlpConfig {
             enabled: env_bool("AV_INGEST_PROXY_YTDLP_ENABLED", true),
             path: env::var("AV_INGEST_PROXY_YTDLP_PATH").unwrap_or_else(|_| "yt-dlp".to_string()),
+            audio_format: env_nonempty("AV_INGEST_PROXY_YTDLP_AUDIO_FORMAT")
+                .unwrap_or_else(|| DEFAULT_YTDLP_AUDIO_FORMAT.to_string()),
             extractor_args: env_nonempty("AV_INGEST_PROXY_YTDLP_EXTRACTOR_ARGS"),
             cookies: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES"),
             cookies_from_browser: env_nonempty("AV_INGEST_PROXY_YTDLP_COOKIES_FROM_BROWSER"),
@@ -654,7 +658,7 @@ impl TranscribeAudioResolver {
             .arg("--force-overwrites")
             .arg("--print-json")
             .arg("--format")
-            .arg("bestaudio[ext=webm]/bestaudio")
+            .arg(&self.proxy.ytdlp.audio_format)
             .arg("--output")
             .arg(output_path);
         apply_ytdlp_auth_args(&mut command, &self.proxy.ytdlp);

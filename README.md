@@ -150,6 +150,20 @@ cache-first ASR jobs. It asks `yt-dlp` to download the selected original
 compressed audio format and returns duration, format, MIME, and file-size
 metadata for local decoders such as SoundKit.
 
+Set `AV_INGEST_PROXY_YTDLP_AUDIO_FORMAT` to change the `yt-dlp` audio selector.
+The default selector uses the best available WebM audio.
+This example prefers audio at or below 64 kbit/s:
+
+```bash
+AV_INGEST_PROXY_YTDLP_AUDIO_FORMAT='bestaudio[ext=webm][abr<=64]/bestaudio[abr<=64]/worstaudio[ext=webm]/worstaudio'
+```
+
+Use this WebM-only selector when the decoder requires Opus:
+
+```bash
+AV_INGEST_PROXY_YTDLP_AUDIO_FORMAT='bestaudio[ext=webm][abr<=64]/worstaudio[ext=webm]/bestaudio[ext=webm]'
+```
+
 ## Notes
 
 `crates/extractor` is a small browser-side helper used by the standalone test UI.
