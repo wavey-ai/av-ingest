@@ -14,6 +14,7 @@ use reqwest::redirect::Policy;
 use reqwest::Url;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::env;
@@ -604,8 +605,12 @@ impl EmbeddedAvIngest {
         Ok(EmbeddedAvIngestResponse {
             status: response.status.as_u16(),
             body: response.body.unwrap_or_default().to_vec(),
-            content_type: response.content_type,
-            headers: response.headers,
+            content_type: response.content_type.map(Cow::into_owned),
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect(),
         })
     }
 }
@@ -832,7 +837,7 @@ impl MediaProxy {
             body: Some(Bytes::from_static(
                 br#"{"status":"ok","service":"av-ingest-proxy"}"#,
             )),
-            content_type: Some("application/json".to_string()),
+            content_type: Some("application/json".into()),
             headers: base_response_headers(),
             etag: None,
         }
@@ -1025,7 +1030,7 @@ impl MediaProxy {
         HandlerResponse {
             status,
             body: Some(Bytes::from(format!("{value:#}\n"))),
-            content_type: Some("application/json; charset=utf-8".to_string()),
+            content_type: Some("application/json; charset=utf-8".into()),
             headers: base_response_headers(),
             etag: None,
         }
@@ -1035,7 +1040,7 @@ impl MediaProxy {
         HandlerResponse {
             status,
             body: Some(Bytes::from(format!("{}\n", message.trim_end()))),
-            content_type: Some("text/plain; charset=utf-8".to_string()),
+            content_type: Some("text/plain; charset=utf-8".into()),
             headers: base_response_headers(),
             etag: None,
         }
@@ -1162,7 +1167,7 @@ impl MediaProxy {
                 HandlerResponse {
                     status: StatusCode::OK,
                     body: Some(Bytes::from(image.bytes)),
-                    content_type: Some(image.content_type.to_string()),
+                    content_type: Some(image.content_type.to_string().into()),
                     headers: base_response_headers(),
                     etag: None,
                 }
@@ -2124,14 +2129,14 @@ impl Router for MediaProxy {
                 body: Some(Bytes::from_static(
                     b"/proxy is a streaming endpoint; use GET or HEAD\n",
                 )),
-                content_type: Some("text/plain; charset=utf-8".to_string()),
+                content_type: Some("text/plain; charset=utf-8".into()),
                 headers: base_response_headers(),
                 etag: None,
             }),
             _ => Ok(HandlerResponse {
                 status: StatusCode::NOT_FOUND,
                 body: Some(Bytes::from_static(b"Not found\n")),
-                content_type: Some("text/plain; charset=utf-8".to_string()),
+                content_type: Some("text/plain; charset=utf-8".into()),
                 headers: base_response_headers(),
                 etag: None,
             }),
@@ -3053,36 +3058,36 @@ fn should_forward_response_header(name: &str) -> bool {
     )
 }
 
-fn base_response_headers() -> Vec<(String, String)> {
+fn base_response_headers() -> Vec<(Cow<'static, str>, Cow<'static, str>)> {
     vec![
-        ("cache-control".to_string(), "no-store".to_string()),
-        ("x-handled-by".to_string(), "av-ingest-proxy".to_string()),
-        ("access-control-allow-origin".to_string(), "*".to_string()),
+        ("cache-control".into(), "no-store".into()),
+        ("x-handled-by".into(), "av-ingest-proxy".into()),
+        ("access-control-allow-origin".into(), "*".into()),
         (
-            "access-control-allow-methods".to_string(),
-            "GET, HEAD, OPTIONS".to_string(),
+            "access-control-allow-methods".into(),
+            "GET, HEAD, OPTIONS".into(),
         ),
         (
-            "access-control-allow-headers".to_string(),
-            CORS_ALLOW_HEADERS.to_string(),
+            "access-control-allow-headers".into(),
+            CORS_ALLOW_HEADERS.into(),
         ),
         (
-            "access-control-allow-private-network".to_string(),
-            "true".to_string(),
+            "access-control-allow-private-network".into(),
+            "true".into(),
         ),
         (
-            "cross-origin-resource-policy".to_string(),
-            "cross-origin".to_string(),
+            "cross-origin-resource-policy".into(),
+            "cross-origin".into(),
         ),
-        ("timing-allow-origin".to_string(), "*".to_string()),
+        ("timing-allow-origin".into(), "*".into()),
         (
-            "vary".to_string(),
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers".to_string(),
+            "vary".into(),
+            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers".into(),
         ),
         (
-            "access-control-expose-headers".to_string(),
+            "access-control-expose-headers".into(),
             "accept-ranges, content-length, content-range, content-type, etag, last-modified, x-handled-by"
-                .to_string(),
+                .into(),
         ),
     ]
 }
@@ -3261,7 +3266,7 @@ async fn handle_plain_http_request(
         Err(error) => HandlerResponse {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: Some(Bytes::from(format!("Internal server error: {error}\n"))),
-            content_type: Some("text/plain; charset=utf-8".to_string()),
+            content_type: Some("text/plain; charset=utf-8".into()),
             headers: base_response_headers(),
             etag: None,
         },
@@ -3287,7 +3292,7 @@ async fn handle_plain_http_stream(
             return handler_response_to_plain_http(HandlerResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: Some(Bytes::from(format!("Internal server error: {error}\n"))),
-                content_type: Some("text/plain; charset=utf-8".to_string()),
+                content_type: Some("text/plain; charset=utf-8".into()),
                 headers: base_response_headers(),
                 etag: None,
             });
@@ -3296,7 +3301,7 @@ async fn handle_plain_http_stream(
             return handler_response_to_plain_http(HandlerResponse {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 body: Some(Bytes::from_static(b"Internal server error\n")),
-                content_type: Some("text/plain; charset=utf-8".to_string()),
+                content_type: Some("text/plain; charset=utf-8".into()),
                 headers: base_response_headers(),
                 etag: None,
             });
@@ -3315,10 +3320,10 @@ async fn handle_plain_http_stream(
 fn handler_response_to_plain_http(response: HandlerResponse) -> Response<PlainHttpBody> {
     let mut builder = Response::builder().status(response.status);
     if let Some(content_type) = response.content_type {
-        builder = builder.header("content-type", content_type);
+        builder = builder.header("content-type", content_type.as_ref());
     }
     for (name, value) in response.headers {
-        builder = builder.header(name, value);
+        builder = builder.header(name.as_ref(), value.as_ref());
     }
     if let Some(etag) = response.etag {
         builder = builder.header("etag", etag);
